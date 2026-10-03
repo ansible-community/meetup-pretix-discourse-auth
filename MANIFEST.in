@@ -1,0 +1,5 @@
+recursive-include pretix_discourse_auth/static *
+recursive-include pretix_discourse_auth/templates *
+recursive-include pretix_discourse_auth/locale *
+include LICENSE
+exclude .gitlab-ci.yml
