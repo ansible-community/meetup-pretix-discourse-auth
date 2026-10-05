@@ -7,6 +7,7 @@ import time
 from urllib.parse import urlencode
 
 from django.urls import reverse
+from django.utils.translation import gettext_lazy as _
 from pretix.base.auth import BaseAuthBackend
 from pretix.settings import config
 
@@ -15,6 +16,7 @@ logger = logging.getLogger(__name__)
 DISCOURSE_URL = config.get('discourse_auth', 'url', fallback='')
 DISCOURSE_SECRET = config.get('discourse_auth', 'sso_secret', fallback='')
 API_KEY = config.get('discourse_auth', 'api_key', fallback='')
+HOST_PREFIX = config.get('discourse_auth', 'host_prefix', fallback='meetup-host').lower()
 ALLOW_HTTP = config.get('discourse_auth', 'allow_http', fallback='false').lower() == 'true'
 
 _config_errors = []
@@ -31,10 +33,14 @@ if DISCOURSE_URL and DISCOURSE_SECRET and not API_KEY:
     _config_errors.append("discourse_auth.api_key is required for security enrichment")
     logger.error("discourse_auth.api_key is required — backend will not be visible")
 
+if DISCOURSE_URL and DISCOURSE_SECRET and not HOST_PREFIX:
+    _config_errors.append("discourse_auth.host_prefix must not be empty")
+    logger.error("discourse_auth.host_prefix must not be empty — backend will not be visible")
+
 
 class DiscourseAuthBackend(BaseAuthBackend):
     identifier = 'discourse'
-    verbose_name = 'Log in with Discourse'
+    verbose_name = _('Log in with Discourse')
 
     @property
     def visible(self):

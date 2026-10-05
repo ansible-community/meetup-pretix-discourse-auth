@@ -25,7 +25,7 @@ API_KEY = config.get('discourse_auth', 'api_key', fallback='')
 API_USER = config.get('discourse_auth', 'api_username', fallback='system')
 HOST_PREFIX = config.get('discourse_auth', 'host_prefix', fallback='meetup-host').lower()
 STAFF_GROUP = config.get('discourse_auth', 'staff_group', fallback='meetup-admin').lower()
-TEAM_TEMPLATE = config.get('discourse_auth', 'team_template', fallback='Ansible Meetup Staff - {city}')
+TEAM_TEMPLATE = config.get('discourse_auth', 'team_template', fallback='Ansible Meetup Organisers - {city}')
 ENFORCE_2FA = config.get('discourse_auth', 'enforce_2fa_privileged', fallback='true').lower() == 'true'
 API_TIMEOUT = int(config.get('discourse_auth', 'api_timeout', fallback='10'))
 ORGANIZER_SLUG = config.get('discourse_auth', 'organizer', fallback='')
@@ -37,23 +37,19 @@ logger = logging.getLogger(__name__)
 
 _LOGIN_URL = 'control:auth.login'
 
-# Validate host_prefix is not empty
-if DISCOURSE_URL and DISCOURSE_SECRET and not HOST_PREFIX:
-    logger.error("discourse_auth.host_prefix must not be empty")
-
 # Validate team_template contains {city}
 if '{city}' not in TEAM_TEMPLATE:
     logger.error("discourse_auth.team_template must contain {city} — team sync will be disabled")
 
-# Warn if staff_group collides with Discourse automatic groups
+# Warn if admin_group collides with Discourse automatic groups
 _DISCOURSE_AUTO_GROUPS = {
     'everyone', 'admins', 'moderators', 'staff', 'trust_level_0',
     'trust_level_1', 'trust_level_2', 'trust_level_3', 'trust_level_4',
 }
 if STAFF_GROUP in _DISCOURSE_AUTO_GROUPS:
     logger.warning(
-        "discourse_auth.staff_group=%r collides with a Discourse automatic group — "
-        "this may grant is_staff to unintended users", STAFF_GROUP
+        "discourse_auth.admin_group=%r collides with a Discourse automatic group — "
+        "this may grant pretix admin access to unintended users", STAFF_GROUP
     )
 
 
@@ -108,13 +104,19 @@ def return_view(request):
     saved_nonce = request.session.pop('discourse_sso_nonce', None)
     nonce_created = request.session.pop('discourse_sso_nonce_created', None)
 
-    if not saved_nonce or not hmac.compare_digest(parsed_sso.get('nonce', ''), saved_nonce):
-        logger.warning("Nonce mismatch or missing, ip=%s", request.META.get('REMOTE_ADDR'))
+    if not saved_nonce:
+        logger.warning("Nonce missing from session (session expired or new browser), ip=%s", request.META.get('REMOTE_ADDR'))
+        messages.error(request, _('Session expired or invalid nonce. Please try again.'))
+        return redirect(reverse(_LOGIN_URL))
+
+    if not hmac.compare_digest(parsed_sso.get('nonce', ''), saved_nonce):
+        logger.warning("Nonce mismatch (possible replay or tampering), ip=%s", request.META.get('REMOTE_ADDR'))
         messages.error(request, _('Session expired or invalid nonce. Please try again.'))
         return redirect(reverse(_LOGIN_URL))
 
     if nonce_created is None or (time.time() - nonce_created) > NONCE_MAX_AGE_SECONDS:
-        logger.warning("Nonce expired (age >%ds), ip=%s", NONCE_MAX_AGE_SECONDS, request.META.get('REMOTE_ADDR'))
+        nonce_age = int(time.time() - nonce_created) if nonce_created else -1
+        logger.warning("Nonce expired (age=%ds, max=%ds), ip=%s", nonce_age, NONCE_MAX_AGE_SECONDS, request.META.get('REMOTE_ADDR'))
         messages.error(request, _('Session expired or invalid nonce. Please try again.'))
         return redirect(reverse(_LOGIN_URL))
 
@@ -153,7 +155,7 @@ def return_view(request):
 
     # Step 7: 2FA enforcement (protocol layer)
     if ENFORCE_2FA and privileged and parsed_sso.get('no_2fa_methods') == 'true':
-        logger.warning("Privileged user has no 2FA methods, external_id=%s", external_id)
+        logger.warning("Privileged user has no 2FA methods, external_id=%s, username=%s", external_id, username)
         messages.error(request, _('Privileged account blocked: Please enable 2FA in your Discourse security settings.'))
         return redirect(reverse(_LOGIN_URL))
 
@@ -189,7 +191,7 @@ def return_view(request):
                 messages.error(request, _('Could not verify security status with Discourse. Please try again later.'))
                 return redirect(reverse(_LOGIN_URL))
 
-            api_data = raw_data.get('user', raw_data)
+            api_data = raw_data
             has_2fa = bool(api_data.get('second_factor_enabled'))
             is_silenced = bool(api_data.get('silenced_till'))
             is_suspended = bool(api_data.get('suspended_till'))
