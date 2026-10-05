@@ -47,7 +47,7 @@ When an operator clicks "Log in with Discourse," they are redirected to Discours
 1. Verifies the cryptographic SSO payload.
 2. Provisions or updates a pretix user account.
 3. Enforces security policies (2FA requirements, moderation blocks, RTBF detection).
-4. Syncs Discourse group memberships to pretix team assignments — mapping meetup host groups (e.g., `meetup-host-berlin`) to pretix teams (e.g., `Ansible Meetup Staff - Berlin`).
+4. Syncs Discourse group memberships to pretix team assignments — mapping meetup host groups (e.g., `meetup-host-berlin`) to pretix teams (e.g., `Ansible Meetup Organisers - Berlin`).
 
 ### Core value proposition
 
@@ -158,7 +158,7 @@ Username and display name heuristics are **not used** — they produce false pos
 
 - Call `GET {DISCOURSE_URL}/admin/users/{external_id}.json` with headers `Api-Key` and `Api-Username`.
 - Timeout: 10 seconds (configurable via `api_timeout`).
-- Parse response JSON once, store in a local variable.
+- Parse response JSON once, store in a local variable. The Discourse Admin API returns the user object directly (`root: false`), so `api_data = raw_data` — no `raw_data.get('user', raw_data)` wrapper needed.
 
 **On HTTP 200, extract:**
 
@@ -175,6 +175,8 @@ is_silenced = bool(api_data.get('silenced_till'))
 is_suspended = bool(api_data.get('suspended_till'))
 has_2fa = bool(api_data.get('second_factor_enabled'))
 ```
+
+**`second_factor_enabled` suppression in SSO mode:** When Discourse is configured as an SSO provider (`enable_discourse_connect` is true), the `AdminUserListSerializer`'s `include_second_factor_enabled?` guard returns `false`. The `AdminDetailedUserSerializer` overrides the value but may inherit the suppression. In practice, this means `second_factor_enabled` may be **absent** from the API response in SSO-enabled deployments. `api_data.get('second_factor_enabled')` returns `None` → `bool(None)` = `False`, causing the enrichment-layer 2FA check to fail-secure (block privileged users). The **protocol-layer check** (Step 7, `no_2fa_methods`) is the effective 2FA enforcement; the enrichment check is defense-in-depth that may be overly strict in SSO deployments.
 
 **On any error (network, timeout, non-200, invalid JSON):** Fail secure — reject login with "Could not verify security status with Discourse." All API errors are treated identically: the enrichment check cannot be completed, so access is denied. There is no distinction between network errors and HTTP errors. See [Rejection Matrix R9](#34-rejection-matrix).
 
@@ -230,7 +232,7 @@ Team.objects.filter(organizer=ORGANIZER, name__in=expected_team_names)
 
 **Remove from stale teams:**
 - Compute the "managed prefix" by splitting `TEAM_TEMPLATE` on `{city}` and taking the left side, stripped.
-  - Example: `"Ansible Meetup Staff - {city}"` → prefix `"Ansible Meetup Staff -"`
+  - Example: `"Ansible Meetup Organisers - {city}"` → prefix `"Ansible Meetup Organisers -"`
 - Find all teams the user belongs to **within the configured organizer** whose name starts with that prefix.
 - Remove the user from any of those teams that are NOT in the expected set.
 
@@ -261,9 +263,11 @@ Every rejection scenario in the callback flow, consolidated in one table. All re
 | R2 | 2 | HMAC signature mismatch | "Signature mismatch. Authentication failed." | WARNING | Client IP, truncated `sig` |
 | R3 | 3 | Invalid base64 or UTF-8 in payload | "Could not decode Discourse response." | WARNING | Client IP |
 | R4 | 3 | Payload contains `failed=true` | "Discourse authentication failed or was cancelled." | INFO | Client IP |
-| R5 | 4 | Nonce mismatch, missing, or expired (>10 min) | "Session expired or invalid nonce. Please try again." | WARNING | Client IP, expiry reason |
+| R5a | 4 | Nonce missing from session (session expired or new browser) | "Session expired or invalid nonce. Please try again." | WARNING | Client IP, cause: "missing" |
+| R5b | 4 | Nonce mismatch (possible replay or tampering) | "Session expired or invalid nonce. Please try again." | WARNING | Client IP, cause: "mismatch" |
+| R5c | 4 | Nonce expired (age > 10 min) | "Session expired or invalid nonce. Please try again." | WARNING | Client IP, nonce age in seconds, max age |
 | R6 | 5 | Missing `external_id` or `email` | "Incomplete identity data received." | WARNING | Client IP |
-| R7 | 7 | Privileged user + `no_2fa_methods=true` | "Privileged account blocked: Please enable 2FA in your Discourse security settings." | WARNING | `external_id`, username |
+| R7 | 7 | Privileged user + `no_2fa_methods=true` | "Privileged account blocked: Please enable 2FA in your Discourse security settings." | WARNING | `external_id`, `username` |
 | R8 | 8 | Email ends with `@anonymized.invalid` | "Account blocked: Anonymized account detected." | WARNING | `external_id` |
 | R9 | 9 | Enrichment API error (any: network, timeout, non-200, invalid JSON) | "Could not verify security status with Discourse. Please try again later." | ERROR | Exception type, URL (no API key), HTTP status if available |
 | R10 | 10 | User is silenced (`silenced_till` present and non-null) | "Account blocked: Moderation (silenced)." | WARNING | `external_id` |
@@ -349,7 +353,7 @@ All configuration is read from pretix's `pretix.cfg` file (INI format) under the
 | `organizer`              | Yes      | —                    | Pretix organizer slug. Team queries are scoped to this organizer. Required because pretix Team names are not globally unique. |
 | `host_prefix`            | No       | `meetup-host`        | Group name prefix identifying meetup hosts. **Must not be empty.** |
 | `staff_group`            | No       | `meetup-admin`       | Discourse group name that grants pretix `is_staff` (exact match, case-insensitive). **Must not collide with Discourse automatic group names** (`staff`, `admins`, `moderators`, `trust_level_*`, `everyone`, etc.). |
-| `team_template`          | No       | `Ansible Meetup Staff - {city}` | Python format string. **Must contain `{city}`.** |
+| `team_template`          | No       | `Ansible Meetup Organisers - {city}` | Python format string. **Must contain `{city}`.** |
 | `enforce_2fa_privileged` | No       | `true`               | Require 2FA for privileged users. Enforced at two layers: DiscourseConnect protocol (`require_2fa`) and enrichment API (`second_factor_enabled`). |
 | `api_timeout`            | No       | `10`                 | Timeout in seconds for Discourse Admin API calls. |
 | `allow_http`             | No       | `false`              | Allow non-HTTPS Discourse URL. **For local development only.** |
@@ -365,7 +369,7 @@ api_username = system
 organizer = ansible-meetups
 host_prefix = meetup-host
 staff_group = meetup-admin
-team_template = Ansible Meetup Staff - {city}
+team_template = Ansible Meetup Organisers - {city}
 enforce_2fa_privileged = true
 ```
 
@@ -609,7 +613,7 @@ The plugin never creates or deletes teams. When a Discourse group maps to a city
 
 **Operational procedure for new cities:**
 1. Create the Discourse group (e.g., `meetup-host-tokyo`).
-2. Create the pretix team (e.g., `Ansible Meetup Staff - Tokyo`) within the configured organizer and set its permissions.
+2. Create the pretix team (e.g., `Ansible Meetup Organisers - Tokyo`) within the configured organizer and set its permissions.
 3. Add users to the Discourse group — team membership syncs on their next login.
 
 ---
@@ -649,12 +653,13 @@ These items require human decisions or actions before the plugin can be deployed
 - [ ] **Restrict group creation** to Discourse admins. If non-admin users can create groups, they could create `meetup-host-*` groups and grant themselves pretix team membership.
 - [ ] **Create `meetup-host-{city}` groups** for each city that needs a pretix team.
 - [ ] **Generate a Discourse Admin API key** with "All Users" scope. Record it for `pretix.cfg`.
+- [ ] **Verify `groups` is in the DiscourseConnect provider claims.** In Discourse admin → Settings → DiscourseConnect, check that `discourse_connect_provider_claims` includes `groups`. Without this, the SSO payload will not include group memberships and team sync will silently produce no matches.
 
 ### 9.2 Pretix configuration (pretix admin must complete)
 
 - [ ] **Create a break-glass local admin account** via `python manage.py createsuperuser`. This provides emergency access if Discourse is unavailable.
 - [ ] **Determine the organizer slug** — run `Organizer.objects.values_list('slug', flat=True)` in the pretix shell to list available organizers. Set this as `organizer` in `pretix.cfg`.
-- [ ] **Create pretix teams** for each city, following the `team_template` pattern (e.g., `Ansible Meetup Staff - Berlin`). Configure appropriate permissions on each team (which events they can manage, what actions they can take).
+- [ ] **Create pretix teams** for each city, following the `team_template` pattern (e.g., `Ansible Meetup Organisers - Berlin`). Configure appropriate permissions on each team (which events they can manage, what actions they can take).
 - [ ] **Configure `pretix.cfg`** with all required values. See [Appendix C](#appendix-c-config-quick-reference).
 - [ ] **Restart pretix** after config changes (config is loaded at module import time).
 
@@ -770,7 +775,7 @@ organizer = ansible-meetups
 api_username = system
 host_prefix = meetup-host
 staff_group = meetup-admin
-team_template = Ansible Meetup Staff - {city}
+team_template = Ansible Meetup Organisers - {city}
 enforce_2fa_privileged = true
 api_timeout = 10
 allow_http = false
