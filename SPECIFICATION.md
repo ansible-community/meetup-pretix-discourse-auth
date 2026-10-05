@@ -1,8 +1,7 @@
 # Technical Specification: pretix-discourse-auth
 
-**Version:** 2.0  
 **Date:** 2026-10-05  
-**Status:** DRAFT — all design decisions resolved. Ready for implementation review.  
+**Status:** DRAFT
 **Audience:** Engineering team rebuilding from scratch  
 
 ---
