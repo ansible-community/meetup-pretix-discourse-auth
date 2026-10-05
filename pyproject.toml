@@ -13,6 +13,7 @@ maintainers = [
 ]
 
 dependencies = [
+    "requests",
 ]
 
 [project.entry-points."pretix.plugin"]
