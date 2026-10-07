@@ -5,11 +5,8 @@ import hmac
 import logging
 import math
 import re
-import time
-import urllib.parse
-from urllib.parse import parse_qsl
-
 import requests
+import time
 from django.contrib import messages
 from django.core.cache import cache
 from django.core.exceptions import ValidationError
@@ -18,11 +15,11 @@ from django.db import transaction
 from django.shortcuts import redirect
 from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
-
 from pretix.base.models import Team, User
 from pretix.base.models.auth import EmailAddressTakenError
 from pretix.base.models.organizer import Organizer
 from pretix.control.views.auth import process_login
+from urllib.parse import parse_qsl
 
 from .backend import (
     AUTH_SESSION_IDLE_TIMEOUT_SECONDS,
@@ -30,8 +27,8 @@ from .backend import (
     DISCOURSE_USERNAME_RE,
     MAX_SSO_PAYLOAD_LENGTH,
     NONCE_MAX_AGE_SECONDS,
-    ORGANIZERS_GROUP_RE,
     ORGANISERS_GROUP_PREFIX,
+    ORGANIZERS_GROUP_RE,
     RTBF_EMAIL_SUFFIX,
     SETTINGS,
     STAFF_TEAM_NAME,

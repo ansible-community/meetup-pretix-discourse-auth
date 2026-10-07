@@ -6,12 +6,11 @@ import re
 import secrets
 import time
 from dataclasses import dataclass
-from urllib.parse import urlencode, urlparse
-
 from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
 from pretix.base.auth import BaseAuthBackend
 from pretix.settings import config
+from urllib.parse import urlencode, urlparse
 
 logger = logging.getLogger(__name__)
 
