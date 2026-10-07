@@ -134,7 +134,13 @@ def return_view(request):
         external_id, username, len(groups_set), is_staff_group_member, privileged
     )
 
-    # Step 7: 2FA enforcement (protocol layer)
+    # Step 7: Require affirmative proof that DiscourseConnect completed the
+    # required challenge. A configured factor alone is not evidence of use.
+    if privileged and parsed_sso.get('confirmed_2fa') != 'true':
+        logger.warning("DiscourseConnect did not attest 2FA for privileged user, external_id=%s", external_id)
+        messages.error(request, _('Privileged account blocked: Discourse did not confirm two-factor authentication.'))
+        return redirect(reverse(_LOGIN_URL))
+
     if privileged and parsed_sso.get('no_2fa_methods') == 'true':
         logger.warning("Privileged user has no 2FA methods, external_id=%s, username=%s", external_id, username)
         messages.error(request, _('Privileged account blocked: Please enable 2FA in your Discourse security settings.'))
