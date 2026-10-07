@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 DISCOURSE_URL = config.get('discourse_auth', 'url', fallback='')
 DISCOURSE_SECRET = config.get('discourse_auth', 'sso_secret', fallback='')
 API_KEY = config.get('discourse_auth', 'api_key', fallback='')
-HOST_PREFIX = config.get('discourse_auth', 'host_prefix', fallback='meetup-host').lower()
 ALLOW_HTTP = config.get('discourse_auth', 'allow_http', fallback='false').lower() == 'true'
 
 _config_errors = []
@@ -32,11 +31,6 @@ if DISCOURSE_SECRET and len(DISCOURSE_SECRET) < 32:
 if DISCOURSE_URL and DISCOURSE_SECRET and not API_KEY:
     _config_errors.append("discourse_auth.api_key is required for security enrichment")
     logger.error("discourse_auth.api_key is required — backend will not be visible")
-
-if DISCOURSE_URL and DISCOURSE_SECRET and not HOST_PREFIX:
-    _config_errors.append("discourse_auth.host_prefix must not be empty")
-    logger.error("discourse_auth.host_prefix must not be empty — backend will not be visible")
-
 
 class DiscourseAuthBackend(BaseAuthBackend):
     identifier = 'discourse'
@@ -55,6 +49,8 @@ class DiscourseAuthBackend(BaseAuthBackend):
         request.session['discourse_sso_nonce_created'] = time.time()
 
         return_url = request.build_absolute_uri(reverse('plugins:pretix_discourse_auth:return'))
+        # This is a fixed security policy: DiscourseConnect challenges for 2FA
+        # during authentication. A successful signed callback is the assertion.
         payload = f"nonce={nonce}&return_sso_url={return_url}&require_2fa=true"
 
         payload_b64 = base64.b64encode(payload.encode('utf-8')).decode('utf-8')

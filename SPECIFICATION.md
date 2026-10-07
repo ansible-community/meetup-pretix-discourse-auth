@@ -19,7 +19,7 @@ These terms are used consistently throughout this document.
 | **Privileged user** | A user who belongs to the staff group OR any host group. Privileged users are held to higher security requirements (2FA, enrichment checks). |
 | **Enrichment** | A server-to-server call from pretix to Discourse's Admin API to retrieve security metadata (silenced, suspended status) not available in the SSO payload. |
 | **RTBF** | Right To Be Forgotten. Refers to a Discourse user whose account has been anonymized. Discourse replaces the email with `{username}@anonymized.invalid`, changes the username to `anon{digits}`, and destroys all auth records. |
-| **Staff group** | A dedicated Discourse group (configurable, default `meetup-admin`) whose members receive pretix `is_staff` access. Distinct from the Discourse `admin` flag. |
+| **Staff group** | A dedicated Discourse group (configurable via `staff_group`, default `meetup-admin`) whose members receive pretix `is_staff` (site-wide admin) access. Uses the term "staff" to match Django/pretix conventions (`is_staff`, `staff_member_required`, `StaffSession`). Distinct from the Discourse `admin` flag. |
 | **Host group** | A Discourse group whose name starts with `HOST_PREFIX` (default `meetup-host`), identifying meetup organizers for a specific city. |
 | **Managed team** | A pretix Team whose name matches the `TEAM_TEMPLATE` pattern. The plugin manages membership of these teams; it never creates or deletes them. |
 | **Fail secure** | When a security check cannot be completed (API error, missing config, ambiguous state), deny access rather than allow it. This is the default posture for all decisions in this system. |
