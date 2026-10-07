@@ -647,7 +647,7 @@ These are security tradeoffs the operator should understand and accept:
 
 4. **Login-time-only sync:** Organizer team membership syncs at login. A user removed from an organizer group retains team access until their next login or manual removal in Pretix. Pretix staff-team and `is_staff` membership remain administrator-managed.
 
-5. **Session lifetime:** Discourse SSO sessions use a three-hour idle timeout. Pretix also enforces its configured absolute session limit (12 hours in the current supported Pretix version); the plugin disables Pretix's "keep me logged in" behavior. These server-wide limits are Pretix deployment settings and cannot be changed through the organizer API used by `provision_environment.py`.
+5. **Session lifetime:** Discourse SSO sessions use a three-hour idle timeout and disable Pretix's "keep me logged in" behavior. The current Pretix version also enforces a 12-hour absolute limit in Pretix core. The organizer API used by `provision_environment.py` cannot change that server-side limit; changing it requires a Pretix server override.
 
 6. **Silenced users with active sessions:** A user silenced in Discourse after their last pretix login retains their pretix session. The silenced check only runs during the enrichment call at login time. Same future improvement as item 4.
 
