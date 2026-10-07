@@ -118,9 +118,9 @@ def return_view(request):
     # Step 6: Group parsing
     # Discard every claim except the exact staff name and exact city-group form.
     allowed_groups = {
-        group.strip()
+        group
         for group in parsed_sso.get('groups', '').split(',')
-        if group.strip() == STAFF_GROUP or ORGANIZERS_GROUP_RE.fullmatch(group.strip())
+        if group == STAFF_GROUP or ORGANIZERS_GROUP_RE.fullmatch(group)
     }
     organizer_groups = [
         match for group in allowed_groups
