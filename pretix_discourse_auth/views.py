@@ -1,14 +1,20 @@
 import base64
+import binascii
 import hashlib
 import hmac
 import logging
+import math
 import re
-import time
+import unicodedata
 import urllib.parse
+import time
 from urllib.parse import parse_qsl
 
 import requests
 from django.contrib import messages
+from django.core.cache import cache
+from django.core.exceptions import ValidationError
+from django.core.validators import validate_email
 from django.db import transaction
 from django.shortcuts import redirect
 from django.urls import reverse
@@ -18,272 +24,235 @@ from pretix.base.models import Team, User
 from pretix.base.models.auth import EmailAddressTakenError
 from pretix.base.models.organizer import Organizer
 from pretix.control.views.auth import process_login
-from pretix.settings import config
 
-DISCOURSE_URL = config.get('discourse_auth', 'url', fallback='')
-DISCOURSE_SECRET = config.get('discourse_auth', 'sso_secret', fallback='')
-API_KEY = config.get('discourse_auth', 'api_key', fallback='')
-API_USER = config.get('discourse_auth', 'api_username', fallback='system')
-STAFF_GROUP = 'meetup-staff'
-ORGANIZERS_GROUP_RE = re.compile(r'^meetup-organisers-([a-z]+)$')
-TEAM_TEMPLATE = 'Ansible Meetup Organisers - {city}'
-API_TIMEOUT = int(config.get('discourse_auth', 'api_timeout', fallback='10'))
-ORGANIZER_SLUG = config.get('discourse_auth', 'organizer', fallback='')
-
-RTBF_EMAIL_SUFFIX = '@anonymized.invalid'
-NONCE_MAX_AGE_SECONDS = 600
+from .backend import (
+    NONCE_MAX_AGE_SECONDS,
+    ORGANIZERS_GROUP_RE,
+    ORGANISERS_GROUP_PREFIX,
+    RTBF_EMAIL_SUFFIX,
+    SETTINGS,
+    TEAM_NAME_PREFIX,
+)
 
 logger = logging.getLogger(__name__)
 
-_LOGIN_URL = 'control:auth.login'
+_LOGIN_URL = "control:auth.login"
+_EXTERNAL_ID_RE = re.compile(r"^[0-9]{1,20}$")
+_USERNAME_RE = re.compile(r"^[a-z0-9_.-]{1,60}$")
 
-def _get_organizer():
-    if not ORGANIZER_SLUG:
-        logger.error("discourse_auth.organizer is not configured — team sync disabled")
+
+def _reject(request, message, *, log_message=None):
+    if log_message:
+        logger.warning(log_message)
+    messages.error(request, message)
+    return redirect(reverse(_LOGIN_URL))
+
+
+def _resolve_organizer():
+    if not SETTINGS.organizer_slug or SETTINGS.organizer_error:
+        logger.error("Pretix organizer configuration is missing or invalid")
         return None
     try:
-        return Organizer.objects.get(slug=ORGANIZER_SLUG)
+        return Organizer.objects.get(slug=SETTINGS.organizer_slug)
     except Organizer.DoesNotExist:
-        logger.error("discourse_auth.organizer=%r not found in pretix", ORGANIZER_SLUG)
+        logger.error("Configured Pretix organizer %r does not exist", SETTINGS.organizer_slug)
         return None
+
+
+def _slug_from_team_name(name):
+    """Map the provisioned display name suffix to its lowercase ASCII slug."""
+    suffix = name[len(TEAM_NAME_PREFIX):]
+    ascii_suffix = unicodedata.normalize("NFKD", suffix).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z]", "", ascii_suffix.lower())
+
+
+def _team_names_for_city_slugs(organizer, city_slugs):
+    teams_by_slug = {}
+    for team in Team.objects.filter(organizer=organizer, name__startswith=TEAM_NAME_PREFIX):
+        slug = _slug_from_team_name(team.name)
+        teams_by_slug.setdefault(slug, []).append(team.name)
+    result = {}
+    for slug in city_slugs:
+        matches = teams_by_slug.get(slug, [])
+        if len(matches) != 1:
+            return None
+        result[slug] = matches[0]
+    return result
+
+
+def _parse_sso(sso):
+    decoded = base64.b64decode(sso, validate=True).decode("utf-8")
+    pairs = parse_qsl(decoded, keep_blank_values=True, strict_parsing=True)
+    if len(dict(pairs)) != len(pairs):
+        raise ValueError("duplicate SSO parameter")
+    return dict(pairs)
 
 
 def return_view(request):
-    sso = request.GET.get('sso')
-    sig = request.GET.get('sig')
+    sso = request.GET.get("sso")
+    sig = request.GET.get("sig")
+    if SETTINGS.errors:
+        logger.error("Discourse auth callback reached with invalid plugin configuration")
+        return _reject(request, _("Discourse authentication is not configured correctly."))
 
-    if not sso or not sig:
-        logger.warning("SSO callback missing sso or sig parameter, ip=%s", request.META.get('REMOTE_ADDR'))
-        messages.error(request, _('Invalid response from Discourse.'))
-        return redirect(reverse(_LOGIN_URL))
+    if not sso or not sig or not re.fullmatch(r"[0-9a-f]{64}", sig):
+        return _reject(request, _("Invalid response from Discourse."), log_message="Malformed SSO callback")
 
-    # Step 2: Signature verification (constant-time)
-    # Do NOT strip whitespace from sso — trailing newline is part of signed content
     expected_sig = hmac.new(
-        DISCOURSE_SECRET.encode('utf-8'),
-        sso.encode('utf-8'),
-        hashlib.sha256
+        SETTINGS.discourse_secret.encode("utf-8"), sso.encode("utf-8"), hashlib.sha256
     ).hexdigest()
-
     if not hmac.compare_digest(sig, expected_sig):
-        logger.warning("Signature mismatch, ip=%s, sig=%s...", request.META.get('REMOTE_ADDR'), sig[:8])
-        messages.error(request, _('Signature mismatch. Authentication failed.'))
-        return redirect(reverse(_LOGIN_URL))
+        return _reject(request, _("Signature mismatch. Authentication failed."), log_message="SSO signature mismatch")
 
-    # Step 3: Decode payload
     try:
-        decoded_sso = base64.b64decode(sso).decode('utf-8')
-        parsed_sso = dict(parse_qsl(decoded_sso))
-    except Exception:
-        logger.warning("Failed to decode SSO payload, ip=%s", request.META.get('REMOTE_ADDR'))
-        messages.error(request, _('Could not decode Discourse response.'))
-        return redirect(reverse(_LOGIN_URL))
+        parsed_sso = _parse_sso(sso)
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        return _reject(request, _("Could not decode Discourse response."), log_message="Malformed signed SSO payload")
 
-    if parsed_sso.get('failed') == 'true':
-        logger.info("Discourse SSO cancelled by user, ip=%s", request.META.get('REMOTE_ADDR'))
-        messages.error(request, _('Discourse authentication failed or was cancelled.'))
-        return redirect(reverse(_LOGIN_URL))
+    if parsed_sso.get("failed") == "true":
+        return _reject(request, _("Discourse authentication failed or was cancelled."))
 
-    # Step 4: Nonce verification (replay protection + time expiry)
-    saved_nonce = request.session.pop('discourse_sso_nonce', None)
-    nonce_created = request.session.pop('discourse_sso_nonce_created', None)
+    saved_nonce = request.session.pop("discourse_sso_nonce", None)
+    nonce_created = request.session.pop("discourse_sso_nonce_created", None)
+    callback_nonce = parsed_sso.get("nonce")
+    if (
+        not isinstance(saved_nonce, str)
+        or not isinstance(callback_nonce, str)
+        or not hmac.compare_digest(callback_nonce, saved_nonce)
+        or isinstance(nonce_created, bool)
+        or not isinstance(nonce_created, (int, float))
+        or not math.isfinite(nonce_created)
+    ):
+        return _reject(request, _("Session expired or invalid nonce."), log_message="Invalid SSO nonce state")
 
-    if not saved_nonce:
-        logger.warning("Nonce missing from session (session expired or new browser), ip=%s", request.META.get('REMOTE_ADDR'))
-        messages.error(request, _('Session expired or invalid nonce. Please try again.'))
-        return redirect(reverse(_LOGIN_URL))
+    nonce_age = time.time() - nonce_created
+    if nonce_age < 0 or nonce_age > NONCE_MAX_AGE_SECONDS:
+        return _reject(request, _("Session expired or invalid nonce."), log_message="Expired or future SSO nonce")
 
-    if not hmac.compare_digest(parsed_sso.get('nonce', ''), saved_nonce):
-        logger.warning("Nonce mismatch (possible replay or tampering), ip=%s", request.META.get('REMOTE_ADDR'))
-        messages.error(request, _('Session expired or invalid nonce. Please try again.'))
-        return redirect(reverse(_LOGIN_URL))
+    # Cache.add is an atomic one-time claim on supported Django cache backends,
+    # preventing two concurrent callbacks from consuming the same nonce.
+    nonce_key = "discourse-sso-used:" + hashlib.sha256(saved_nonce.encode("utf-8")).hexdigest()
+    if not cache.add(nonce_key, True, timeout=NONCE_MAX_AGE_SECONDS):
+        return _reject(request, _("Session expired or invalid nonce."), log_message="Replayed SSO nonce")
 
-    if nonce_created is None or (time.time() - nonce_created) > NONCE_MAX_AGE_SECONDS:
-        nonce_age = int(time.time() - nonce_created) if nonce_created else -1
-        logger.warning("Nonce expired (age=%ds, max=%ds), ip=%s", nonce_age, NONCE_MAX_AGE_SECONDS, request.META.get('REMOTE_ADDR'))
-        messages.error(request, _('Session expired or invalid nonce. Please try again.'))
-        return redirect(reverse(_LOGIN_URL))
+    external_id = parsed_sso.get("external_id", "")
+    raw_email = parsed_sso.get("email", "")
+    raw_username = parsed_sso.get("username", "")
+    name = parsed_sso.get("name") or raw_username
+    if (
+        not isinstance(external_id, str)
+        or not isinstance(raw_email, str)
+        or not isinstance(raw_username, str)
+        or not isinstance(name, str)
+    ):
+        return _reject(request, _("Incomplete or invalid identity data received."), log_message="Invalid SSO identity fields")
+    email = raw_email.lower()
+    username = raw_username.lower()
+    if (
+        not _EXTERNAL_ID_RE.fullmatch(external_id)
+        or not _USERNAME_RE.fullmatch(username)
+        or len(email) > 254
+        or len(name) > 200
+    ):
+        return _reject(request, _("Incomplete or invalid identity data received."), log_message="Invalid SSO identity fields")
+    try:
+        validate_email(email)
+    except ValidationError:
+        return _reject(request, _("Incomplete or invalid identity data received."), log_message="Invalid SSO email")
 
-    # Step 5: Extract identity
-    external_id = parsed_sso.get('external_id')
-    email = parsed_sso.get('email', '').lower()
-    username = parsed_sso.get('username', '').lower()
-    name = parsed_sso.get('name', '') or parsed_sso.get('username', '')
+    raw_groups = parsed_sso.get("groups", "")
+    if not isinstance(raw_groups, str) or len(raw_groups) > 8192:
+        return _reject(request, _("Invalid group data received."), log_message="Malformed SSO group claim")
+    group_names = raw_groups.split(",") if raw_groups else []
+    city_slugs = set()
+    for group_name in group_names:
+        if group_name.startswith(ORGANISERS_GROUP_PREFIX):
+            match = ORGANIZERS_GROUP_RE.fullmatch(group_name)
+            if match is None:
+                return _reject(request, _("Invalid organiser group data received."), log_message="Malformed organiser group claim")
+            city_slugs.add(match.group(1))
+    is_organizer = bool(city_slugs)
 
-    if not external_id or not email:
-        logger.warning("Incomplete identity data, ip=%s", request.META.get('REMOTE_ADDR'))
-        messages.error(request, _('Incomplete identity data received.'))
-        return redirect(reverse(_LOGIN_URL))
+    if is_organizer and parsed_sso.get("confirmed_2fa") != "true":
+        return _reject(
+            request,
+            _("Organiser account blocked: Discourse did not confirm two-factor authentication."),
+            log_message=f"DiscourseConnect did not attest 2FA for external_id={external_id}",
+        )
 
-    # Step 6: Group parsing
-    # Discard every claim except the exact staff name and exact city-group form.
-    allowed_groups = {
-        group
-        for group in parsed_sso.get('groups', '').split(',')
-        if group == STAFF_GROUP or ORGANIZERS_GROUP_RE.fullmatch(group)
-    }
-    organizer_groups = [
-        match for group in allowed_groups
-        if (match := ORGANIZERS_GROUP_RE.fullmatch(group))
-    ]
-    cities = [match.group(1).title() for match in organizer_groups]
-
-    is_staff_group_member = STAFF_GROUP in allowed_groups
-    privileged = is_staff_group_member or bool(organizer_groups)
-
-    logger.info(
-        "Identity extracted: external_id=%s, username=%s, groups=%d, is_staff=%s, privileged=%s",
-        external_id, username, len(allowed_groups), is_staff_group_member, privileged
-    )
-
-    # Step 7: Require affirmative proof that DiscourseConnect completed the
-    # required challenge. A configured factor alone is not evidence of use.
-    if privileged and parsed_sso.get('confirmed_2fa') != 'true':
-        logger.warning("DiscourseConnect did not attest 2FA for privileged user, external_id=%s", external_id)
-        messages.error(request, _('Privileged account blocked: Discourse did not confirm two-factor authentication.'))
-        return redirect(reverse(_LOGIN_URL))
-
-    # Step 8: RTBF detection (email domain only)
     if email.endswith(RTBF_EMAIL_SUFFIX):
-        logger.warning("RTBF/anonymized account detected, external_id=%s", external_id)
-        messages.error(request, _('Account blocked: Anonymized account detected.'))
-        return redirect(reverse(_LOGIN_URL))
+        return _reject(request, _("Account blocked: Anonymized account detected."), log_message="RTBF account attempted SSO")
 
-    # Step 9: Security enrichment (Discourse Admin API) — fail secure on any error
-    if not API_KEY:
-        logger.error("API key not configured — cannot verify security status")
-        messages.error(request, _('Could not verify security status with Discourse. Please try again later.'))
-        return redirect(reverse(_LOGIN_URL))
-
-    is_silenced = False
-    is_suspended = False
-
+    admin_url = f"{SETTINGS.discourse_url}/admin/users/{external_id}.json"
     try:
-        admin_url = f"{DISCOURSE_URL.rstrip('/')}/admin/users/{urllib.parse.quote(str(external_id))}.json"
-        resp = requests.get(
+        response = requests.get(
             admin_url,
-            headers={'Api-Key': API_KEY, 'Api-Username': API_USER},
-            timeout=API_TIMEOUT,
+            headers={"Api-Key": SETTINGS.api_key, "Api-Username": SETTINGS.api_username},
+            timeout=SETTINGS.api_timeout,
             allow_redirects=False,
         )
+        if response.status_code != 200:
+            raise requests.HTTPError(f"Unexpected HTTP status {response.status_code}")
+        data = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        logger.error("Discourse security verification failed: %s", type(exc).__name__)
+        return _reject(request, _("Could not verify security status with Discourse. Please try again later."))
 
-        if resp.status_code == 200:
-            try:
-                raw_data = resp.json()
-            except ValueError:
-                logger.error("Enrichment API returned invalid JSON, url=%s", admin_url)
-                messages.error(request, _('Could not verify security status with Discourse. Please try again later.'))
-                return redirect(reverse(_LOGIN_URL))
+    if (
+        not isinstance(data, dict)
+        or str(data.get("id")) != external_id
+        or not isinstance(data.get("username"), str)
+        or not data["username"]
+        or any(field in data and data[field] is not None and not isinstance(data[field], str)
+               for field in ("silenced_till", "suspended_till"))
+    ):
+        return _reject(request, _("Could not verify security status with Discourse. Please try again later."), log_message="Malformed Discourse security response")
 
-            if not isinstance(raw_data, dict):
-                logger.error("Enrichment API returned a non-object response, url=%s", admin_url)
-                messages.error(request, _('Could not verify security status with Discourse. Please try again later.'))
-                return redirect(reverse(_LOGIN_URL))
+    if data.get("silenced_till") or data.get("suspended_till"):
+        return _reject(request, _("Account blocked: Moderation status prevents login."), log_message="Moderated user attempted SSO")
 
-            response_username = raw_data.get('username')
-            response_id = raw_data.get('id')
-            status_fields = ('silenced_till', 'suspended_till')
-            if (
-                str(response_id) != str(external_id)
-                or not isinstance(response_username, str)
-                or not response_username
-                or any(
-                    field in raw_data and raw_data[field] is not None and not isinstance(raw_data[field], str)
-                    for field in status_fields
-                )
-            ):
-                logger.error("Enrichment API response has invalid identity or moderation fields, url=%s", admin_url)
-                messages.error(request, _('Could not verify security status with Discourse. Please try again later.'))
-                return redirect(reverse(_LOGIN_URL))
-
-            api_data = raw_data
-            is_silenced = bool(api_data.get('silenced_till'))
-            is_suspended = bool(api_data.get('suspended_till'))
-        else:
-            if resp.status_code in (401, 403):
-                logger.error(
-                    "Enrichment API returned %d — API key may be invalid or revoked, url=%s",
-                    resp.status_code, admin_url
-                )
-            else:
-                logger.error("Enrichment API returned %d, url=%s", resp.status_code, admin_url)
-            messages.error(request, _('Could not verify security status with Discourse. Please try again later.'))
-            return redirect(reverse(_LOGIN_URL))
-
-    except requests.RequestException as exc:
-        logger.error("Enrichment API request failed: %s, url=%s", type(exc).__name__, admin_url)
-        messages.error(request, _('Could not verify security status with Discourse. Please try again later.'))
-        return redirect(reverse(_LOGIN_URL))
-
-    # Step 10: Policy enforcement
-    if is_silenced:
-        logger.warning("Account silenced, external_id=%s", external_id)
-        messages.error(request, _('Account blocked: Moderation (silenced).'))
-        return redirect(reverse(_LOGIN_URL))
-
-    if is_suspended:
-        logger.warning("Account suspended, external_id=%s", external_id)
-        messages.error(request, _('Account blocked: Moderation (suspended).'))
-        return redirect(reverse(_LOGIN_URL))
-
-    # Resolve every claimed organiser team before creating or changing the user.
-    organizer = _get_organizer()
-    expected_team_names = [TEAM_TEMPLATE.format(city=city) for city in cities]
-    if expected_team_names:
+    organizer = None
+    expected_team_names = []
+    if is_organizer:
+        if SETTINGS.organizer_error:
+            return _reject(request, _("Could not verify organiser access with Pretix. Please contact an administrator."), log_message=SETTINGS.organizer_error)
+        organizer = _resolve_organizer()
         if organizer is None:
-            logger.error("Cannot validate organiser teams; Pretix organizer is unavailable")
-            messages.error(request, _('Could not verify organiser access with Pretix. Please try again later.'))
-            return redirect(reverse(_LOGIN_URL))
-        found_team_names = set(
-            Team.objects.filter(organizer=organizer, name__in=expected_team_names)
-            .values_list('name', flat=True)
-        )
-        missing_teams = set(expected_team_names) - found_team_names
-        if missing_teams:
-            logger.error("Organiser group has no matching Pretix team(s): %s", sorted(missing_teams))
-            messages.error(request, _('Could not verify organiser access with Pretix. Please contact an administrator.'))
-            return redirect(reverse(_LOGIN_URL))
+            return _reject(request, _("Could not verify organiser access with Pretix. Please contact an administrator."))
+        team_names = _team_names_for_city_slugs(organizer, city_slugs)
+        if team_names is None:
+            return _reject(
+                request,
+                _("Could not verify organiser access with Pretix. Please contact an administrator."),
+                log_message=f"One or more organiser groups have no unique Pretix team: {sorted(city_slugs)}",
+            )
+        expected_team_names = list(team_names.values())
 
-    # Step 11: Provision & update pretix user
     try:
         user = User.objects.get_or_create_for_backend(
-            'discourse',
+            "discourse",
             external_id,
             email,
-            set_always={'fullname': name},
-            set_on_creation={}
+            set_always={"fullname": name},
+            set_on_creation={},
         )
     except EmailAddressTakenError:
-        logger.warning("Email conflict during provisioning, external_id=%s, email=%s", external_id, email)
-        messages.error(request, _(
-            'Email conflict: Another user with this email exists. Please contact an administrator.'
-        ))
-        return redirect(reverse(_LOGIN_URL))
-
-    # Step 12: Staff flag sync (group-based, NOT Discourse admin flag)
-    if user.is_staff != is_staff_group_member:
-        logger.warning(
-            "is_staff changed: external_id=%s, %s → %s (staff_group=%s)",
-            external_id, user.is_staff, is_staff_group_member, STAFF_GROUP
+        return _reject(
+            request,
+            _("Email conflict: Another user with this email exists. Please contact an administrator."),
+            log_message=f"Email conflict during provisioning for external_id={external_id}",
         )
-        user.is_staff = is_staff_group_member
-        user.save(update_fields=['is_staff'])
 
-    # Step 13: Team sync (within a database transaction, scoped to organizer)
+    # Pretix's is_staff flag is owned exclusively by Pretix administrators.
+    # Discourse claims never grant or revoke site-wide administration.
     if organizer is not None:
         with transaction.atomic():
-            if expected_team_names:
-                teams_to_join = Team.objects.filter(organizer=organizer, name__in=expected_team_names)
-                for team in teams_to_join:
-                    team.members.add(user)
-                    logger.info("Team sync: added user %s to %r", external_id, team.name)
-
-            prefix_template = TEAM_TEMPLATE.split('{city}')[0].strip()
-            current_teams = user.teams.filter(organizer=organizer, name__startswith=prefix_template)
+            teams_to_join = Team.objects.filter(organizer=organizer, name__in=expected_team_names)
+            for team in teams_to_join:
+                team.members.add(user)
+            current_teams = user.teams.filter(organizer=organizer, name__startswith=TEAM_NAME_PREFIX)
             for team in current_teams:
                 if team.name not in expected_team_names:
                     team.members.remove(user)
-                    logger.info("Team sync: removed user %s from %r", external_id, team.name)
 
-    # Step 14: Login
     return process_login(request, user, keep_logged_in=False)
