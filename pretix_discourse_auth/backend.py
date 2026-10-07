@@ -4,7 +4,7 @@ import hmac
 import logging
 import secrets
 import time
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
@@ -20,9 +20,33 @@ ALLOW_HTTP = config.get('discourse_auth', 'allow_http', fallback='false').lower(
 
 _config_errors = []
 
-if DISCOURSE_URL and not DISCOURSE_URL.startswith('https://') and not ALLOW_HTTP:
-    _config_errors.append("discourse_auth.url must use HTTPS (set allow_http=true for local dev)")
-    logger.error("discourse_auth.url must use HTTPS — SSO credentials will transit in cleartext")
+if DISCOURSE_URL:
+    try:
+        parsed_discourse_url = urlparse(DISCOURSE_URL)
+        # Reading .port also rejects malformed ports in the configured URL.
+        discourse_port = parsed_discourse_url.port
+        local_discourse_host = parsed_discourse_url.hostname in {'localhost', '127.0.0.1', '::1'}
+        valid_discourse_url = bool(
+            parsed_discourse_url.hostname
+            and parsed_discourse_url.username is None
+            and parsed_discourse_url.password is None
+            and not parsed_discourse_url.query
+            and not parsed_discourse_url.fragment
+            and (discourse_port is None or 1 <= discourse_port <= 65535)
+            and (
+                parsed_discourse_url.scheme == 'https'
+                or (ALLOW_HTTP and parsed_discourse_url.scheme == 'http' and local_discourse_host)
+            )
+        )
+    except ValueError:
+        valid_discourse_url = False
+    if not valid_discourse_url:
+        _config_errors.append(
+            "discourse_auth.url must use HTTPS (HTTP is allowed only for localhost/loopback development)"
+        )
+        logger.error(
+            "discourse_auth.url must use HTTPS — HTTP is allowed only for localhost/loopback development"
+        )
 
 if DISCOURSE_SECRET and len(DISCOURSE_SECRET) < 32:
     _config_errors.append("discourse_auth.sso_secret must be at least 32 characters")
