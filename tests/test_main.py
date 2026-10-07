@@ -3,13 +3,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import pytest
 import time
+from django.test import RequestFactory
 from types import SimpleNamespace
 from unittest.mock import Mock
 from urllib.parse import urlencode
-
-import pytest
-from django.test import RequestFactory
 
 from pretix_discourse_auth import views
 from pretix_discourse_auth.backend import (
