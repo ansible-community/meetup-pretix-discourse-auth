@@ -141,11 +141,6 @@ def return_view(request):
         messages.error(request, _('Privileged account blocked: Discourse did not confirm two-factor authentication.'))
         return redirect(reverse(_LOGIN_URL))
 
-    if privileged and parsed_sso.get('no_2fa_methods') == 'true':
-        logger.warning("Privileged user has no 2FA methods, external_id=%s, username=%s", external_id, username)
-        messages.error(request, _('Privileged account blocked: Please enable 2FA in your Discourse security settings.'))
-        return redirect(reverse(_LOGIN_URL))
-
     # Step 8: RTBF detection (email domain only)
     if email.endswith(RTBF_EMAIL_SUFFIX):
         logger.warning("RTBF/anonymized account detected, external_id=%s", external_id)
@@ -160,7 +155,6 @@ def return_view(request):
 
     is_silenced = False
     is_suspended = False
-    has_2fa = False
 
     try:
         admin_url = f"{DISCOURSE_URL.rstrip('/')}/admin/users/{urllib.parse.quote(str(external_id))}.json"
@@ -179,7 +173,6 @@ def return_view(request):
                 return redirect(reverse(_LOGIN_URL))
 
             api_data = raw_data
-            has_2fa = bool(api_data.get('second_factor_enabled'))
             is_silenced = bool(api_data.get('silenced_till'))
             is_suspended = bool(api_data.get('suspended_till'))
         else:
@@ -207,11 +200,6 @@ def return_view(request):
     if is_suspended:
         logger.warning("Account suspended, external_id=%s", external_id)
         messages.error(request, _('Account blocked: Moderation (suspended).'))
-        return redirect(reverse(_LOGIN_URL))
-
-    if privileged and not has_2fa:
-        logger.warning("Privileged user without 2FA (enrichment layer), external_id=%s", external_id)
-        messages.error(request, _('Privileged account blocked: Please enable 2FA in your Discourse security settings.'))
         return redirect(reverse(_LOGIN_URL))
 
     # Resolve every claimed organiser team before creating or changing the user.
