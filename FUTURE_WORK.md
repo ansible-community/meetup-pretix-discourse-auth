@@ -2,7 +2,7 @@
 
 ## Security Hardening
 
-The plugin now validates HTTPS, expires nonces after ten minutes, requires a working Discourse Admin API key, uses DiscourseConnect's signed 2FA assertion, and wraps team membership updates in a transaction. Staff and organiser groups are fixed in code; organiser groups must match `^meetup-organisers-([a-z]+)$`, and every claimed group must resolve to an organizer-scoped Pretix team.
+The plugin validates HTTPS, expires and atomically consumes nonces after ten minutes, requires a working Discourse Admin API key, uses DiscourseConnect's signed 2FA assertion for organiser claims, and wraps team membership updates in a transaction. Pretix alone controls staff access. Organiser groups must match `^meetup-organisers-([a-z]+)$`, and every claimed group must resolve to one provisioned Pretix team.
 
 ### Active session invalidation
 When the enrichment API detects a user is silenced/suspended, invalidate their existing pretix sessions (via Django's session framework) rather than only blocking new logins.
@@ -44,7 +44,7 @@ The test suite is a placeholder. Priority areas for test coverage:
 - Group-to-city parsing edge cases
 - Team sync (add, remove, no-op, missing teams)
 - Policy enforcement (suspended, silenced, RTBF, 2FA)
-- `is_staff` sync behavior
+- preservation of Pretix-owned `is_staff` across Forum logins
 - API failure modes (timeout, 500, invalid JSON)
 - Email conflict handling
 

@@ -5,6 +5,22 @@ This is a plugin for `pretix`_.
 
 Discourse authentication backend for pretix
 
+Access policy
+-------------
+
+Any valid Forum account can sign in to Pretix as an attendee. Only exact
+``meetup-organisers-{city}`` claims that resolve through the plugin's explicit
+city/team mapping receive city team membership. Pretix admins alone manage the
+``Ansible Meetup Staff`` team and Pretix's site-wide ``is_staff`` flag; Forum
+groups never grant staff access. DiscourseConnect must attest ``confirmed_2fa=true``
+for city organisers, Pretix staff-team members, and Pretix staff accounts.
+
+Every login also requires a working Discourse Admin API key so the plugin can
+reject silenced or suspended accounts. Organizer team configuration errors block
+the affected organizer login; users without organizer claims can still sign in
+as attendees. Sessions created by this backend expire after three hours of
+inactivity, with Pretix's absolute session limit still applying.
+
 Development setup
 -----------------
 

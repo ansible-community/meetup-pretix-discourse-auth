@@ -16,12 +16,13 @@ These terms are used consistently throughout this document.
 | **Provider** | The application that authenticates users and asserts their identity. In this system, **Discourse** (`forum.ansible.com`) is the provider. Sometimes called "identity provider" or "IdP." |
 | **DiscourseConnect** | The SSO protocol used between consumer and provider. Formerly called "Discourse SSO." Uses HMAC-SHA256 signed payloads exchanged via browser redirects. |
 | **SSO payload** | The base64-encoded, HMAC-signed query string exchanged between consumer and provider. Contains identity fields (`external_id`, `email`, `groups`, etc.). |
-| **Privileged user** | A user in `meetup-staff` OR an exact `meetup-organisers-[a-z]+` group. DiscourseConnect must attest that the 2FA challenge succeeded before pretix creates the session. |
+| **Privileged user** | A user with an exact `meetup-organisers-[a-z]+` claim, membership in a city organiser team, membership in the Pretix team `Ansible Meetup Staff`, or Pretix-owned `is_staff=true`. DiscourseConnect must attest that the required 2FA challenge succeeded before Pretix creates the session. |
 | **Enrichment** | A server-to-server call from pretix to Discourse's Admin API to retrieve security metadata (silenced, suspended status) not available in the SSO payload. |
 | **RTBF** | Right To Be Forgotten. Refers to a Discourse user whose account has been anonymized. Discourse replaces the email with `{username}@anonymized.invalid`, changes the username to `anon{digits}`, and destroys all auth records. |
-| **Staff group** | The hardcoded Discourse group `meetup-staff`; its members receive pretix `is_staff` (site-wide admin) access. Distinct from the Discourse `admin` flag. |
+| **Pretix staff** | A Pretix account whose `is_staff` permission is granted by Pretix administrator configuration. The plugin never reads a Forum staff group or changes this flag. |
 | **Organiser group** | A Discourse group whose name fully matches `^meetup-organisers-([a-z]+)$`. Only this exact shape grants city-scoped team access. |
-| **Managed team** | A pretix Team named `Ansible Meetup Organisers - {City}`. The plugin manages membership; it never creates or deletes teams. |
+| **Managed team** | A Pretix Team named `Ansible Meetup Organisers - {City}`. The tooling provisioner creates and reconciles teams; the auth plugin only manages user membership. |
+| **Staff team** | The Pretix-only team `Ansible Meetup Staff`. The provisioner creates it with access to all meetup events; Pretix admins alone manage its members. No Forum group maps to it. |
 | **Fail secure** | When a security check cannot be completed (API error, missing config, ambiguous state), deny access rather than allow it. This is the default posture for all decisions in this system. |
 
 ### Design principle: fail secure
@@ -50,17 +51,17 @@ When an operator clicks "Log in with Discourse," they are redirected to Discours
 
 ### Core value proposition
 
-Ansible community meetup organizers manage events through pretix. Rather than maintaining separate credentials, they log in with the same Discourse identity they already use on `forum.ansible.com`. Their Discourse group memberships automatically determine which pretix teams (and therefore which events/organizers) they can manage — no manual pretix user administration needed.
+Any valid Forum user can sign in to Pretix as an attendee. Only users with an exact city organiser group claim receive membership in the matching Pretix team and its event permissions. Pretix staff access remains controlled by Pretix administrators.
 
 ### Trust model
 
 Discourse is the **provider** and **source of truth** for:
 - User identity (email, username, display name)
-- Group memberships (which cities a host manages, and whether they hold pretix staff access)
+- Group memberships (which cities an organiser manages)
 - Moderation status (silenced, suspended)
 - 2FA challenge completion (via DiscourseConnect's signed `confirmed_2fa` assertion)
 
-Pretix is the **consumer**. It accepts Discourse's signed identity and 2FA assertion, then uses the Admin API only for moderation status. Staff access is controlled by the hardcoded `meetup-staff` group, not the Discourse admin flag.
+Pretix is the **consumer**. It accepts any valid Forum identity as an attendee, uses exact organiser claims only for city-team membership, and uses the Admin API for moderation status. Pretix staff access is granted only by Pretix administrators; the plugin does not use Forum groups to grant or revoke `is_staff`.
 
 ---
 
@@ -79,7 +80,7 @@ Pretix is the **consumer**. It accepts Discourse's signed identity and 2FA asser
 5. An HMAC-SHA256 signature is computed over the base64 payload using the shared SSO secret.
 6. The user's browser is redirected to `{DISCOURSE_URL}/session/sso_provider?sso={payload_b64}&sig={sig}`.
 
-**`require_2fa=true`:** Always sent and is not configurable. For staff and organiser claims, pretix requires the signed callback field `confirmed_2fa=true`. Missing or false is a fatal login rejection. DiscourseConnect is the sole authority for whether the challenge was completed; the Admin API is not used to infer 2FA from account configuration.
+**`require_2fa=true`:** Always sent and is not configurable. For organiser claims and members of the Pretix staff team, Pretix requires the signed callback field `confirmed_2fa=true`. Missing or false is a fatal login rejection. DiscourseConnect is the sole authority for whether the challenge was completed; the Admin API is not used to infer 2FA from account configuration.
 
 **Callback URL format:** `https://{pretix_host}/_discourse/login/return/` (resolved via Django's `reverse()` using the named URL `plugins:pretix_discourse_auth:return`).
 
@@ -104,12 +105,12 @@ All rejection scenarios are consolidated in the [Rejection Matrix](#34-rejection
 - If the payload contains `failed=true`, reject (user cancelled or Discourse denied).
 
 #### Step 4: Nonce verification (replay protection)
-- Pop `discourse_sso_nonce` and `discourse_sso_nonce_created` from the session (single-use: once popped, cannot be reused).
+- Pop `discourse_sso_nonce` and `discourse_sso_nonce_created` from the session, then atomically claim a shared cache key for the nonce; a second or concurrent callback is rejected.
 - Compare the payload's `nonce` against the saved nonce using constant-time comparison.
-- Verify the nonce was created less than **10 minutes** ago (Discourse expires nonces after 30 minutes on its side; 10 minutes provides margin). Reject if stale.
+- Verify the nonce timestamp is numeric, finite, not in the future, and less than **10 minutes** old. Reject malformed or stale data.
 
 #### Step 5: Identity extraction
-Extract from the decoded payload:
+Extract from the strictly base64-decoded and query-parsed payload. Duplicate parameters, invalid UTF-8, non-string claims, malformed email/username/ID fields, and invalid group claim shapes fail before any API or database writes.
 
 | Payload field    | Required | Processing                        | Maps to               |
 |------------------|----------|-----------------------------------|-----------------------|
@@ -117,22 +118,22 @@ Extract from the decoded payload:
 | `email`          | Yes      | Lowercased                        | User email            |
 | `username`       | No       | Lowercased                        | RTBF heuristic input  |
 | `name`           | No       | Falls back to `username` if empty | User fullname         |
-| `groups`         | No       | Comma-separated string → set      | Team sync + staff sync input |
+| `groups`         | No       | Comma-separated string            | Exact organiser group claims only |
 | `confirmed_2fa` | Required for privileged users | `"true"` only after the DiscourseConnect challenge succeeds | Positive 2FA assertion |
 
-The Discourse `admin` flag is **not used**. Staff status is determined by group membership (see Step 10).
+The Discourse `admin` flag and all Forum staff groups are ignored. Pretix administrators own `is_staff`.
 
 If `external_id` or `email` is missing/empty, reject.
 
 #### Step 6: Group parsing
-- Discard every group claim except the hardcoded `meetup-staff` and names fully matching `^meetup-organisers-([a-z]+)$`.
-- The city slug must contain lowercase ASCII letters only; hyphens, spaces, numbers, and arbitrary `meetup-*` groups are ignored.
-- The captured city slug is title-cased to resolve the Pretix team name, e.g. `meetup-organisers-london` → `Ansible Meetup Organisers - London`.
-- A user is **privileged** if they belong to `meetup-staff` or at least one exact organiser group.
+- Ignore all group claims except names fully matching `^meetup-organisers-([a-z]+)$`; malformed names using the organiser prefix reject the callback.
+- The city slug must contain lowercase ASCII letters only; hyphens, spaces, and numbers are not accepted.
+- Resolve the slug through the explicit `CITY_TEAM_NAME_BY_SLUG` mapping and require exactly one team with that canonical display name; do not infer names with title casing or normalization.
+- A user is privileged when they have a valid exact city claim, already belong to a city organiser team or `Ansible Meetup Staff`, or already have Pretix-owned `is_staff=true`. The Forum cannot grant staff-team membership or alter the Pretix staff flag.
 
 #### Step 7: Positive 2FA assertion
 
-For every privileged user, require `confirmed_2fa=true` from the HMAC-verified DiscourseConnect response. Reject when the field is missing or not exactly `"true"`. Do not use `no_2fa_methods` or Admin API account configuration as substitutes for proof that the current authentication passed the challenge.
+For every organizer claim, existing city organiser-team member, Pretix staff-team member, or Pretix `is_staff` user, require `confirmed_2fa=true` from the HMAC-verified DiscourseConnect response. Reject when the field is missing or not exactly `"true"`. Do not use `no_2fa_methods`, Pretix team configuration, or Admin API account configuration as substitutes for proof that the current authentication passed the challenge.
 
 #### Step 8: RTBF detection (heuristic)
 
@@ -147,7 +148,7 @@ Username and display name heuristics are **not used** — they produce false pos
 **Precondition:** `API_KEY` must be configured. If not configured, the auth backend refuses to register at startup (see [Section 5.1 Config Validation](#51-configuration-validation)).
 
 - Call `GET {DISCOURSE_URL}/admin/users/{external_id}.json` with headers `Api-Key` and `Api-Username`.
-- Timeout: 10 seconds (configurable via `api_timeout`).
+- Timeout: 10 seconds by default (`api_timeout`, valid range 1–60).
 - Parse response JSON once, store in a local variable. The Discourse Admin API returns the user object directly (`root: false`), so `api_data = raw_data` — no `raw_data.get('user', raw_data)` wrapper needed.
 
 **On HTTP 200, validate identity and extract moderation status:** The response must contain the requested `id` and a non-empty `username`. `silenced_till` and `suspended_till` are optional; each must be a string or `null` when present. Missing moderation fields mean the user is not in that state, as Discourse omits them for ordinary users. An empty object, mismatched identity, or invalid field type is an API response failure and blocks login.
@@ -180,7 +181,7 @@ Evaluated in order; first match blocks login:
 
 #### Step 11: User provisioning
 
-Before creating or updating a pretix user, resolve every claimed organiser group to its exact Pretix team under the configured organizer. If any matching `meetup-organisers-[a-z]+` group has no corresponding team, reject the login. Do not silently skip that group or grant a partial set of city permissions.
+Before creating or updating a pretix user, resolve every claimed organiser group to exactly one Pretix team under the configured organizer. If the organizer configuration is missing/invalid or a claimed team is missing/ambiguous, reject that organiser login. Do not silently skip a city or grant partial organiser access. A valid attendee with no organiser claims may still log in.
 
 - Call pretix's `User.objects.get_or_create_for_backend('discourse', external_id, email, set_always={'fullname': name}, set_on_creation={})`.
   - The method matches on `('discourse', external_id)`, not email.
@@ -188,18 +189,10 @@ Before creating or updating a pretix user, resolve every claimed organiser group
   - On first creation: no additional fields set.
 - **On `EmailAddressTakenError`:** Reject with "Email conflict: Another user with this email exists on a different auth backend." This is raised when the user's Discourse email matches an existing pretix user linked to a different auth backend. The email update cannot be skipped — it is hardcoded in pretix's `get_or_create_for_backend`. Admin intervention is required to resolve the conflict.
 
-#### Step 12: Staff flag sync (group-based)
+#### Step 12: Pretix staff permission ownership
 
-- Determine whether the user should have pretix `is_staff` by exact membership in hardcoded `meetup-staff`.
-- If the user's current `is_staff` value does not match, update it.
-- This is a **write-on-every-login** operation, not an event-driven sync.
-- The Discourse `admin` flag is explicitly **not used** — it maps to Discourse forum administration, which is a different trust domain from pretix infrastructure access.
-- `is_staff` in pretix grants **site-wide admin access** across all organizers (verified in source: `staff_member_required` decorator).
+The plugin never reads a Forum staff group and never writes `User.is_staff`. Pretix administrators grant and revoke site-wide staff access through Pretix configuration. Discourse group claims cannot grant or remove this permission.
 
-**Implications:**
-- Only users in hardcoded `meetup-staff` get pretix staff access.
-- Removing a user from the Discourse group revokes pretix staff on their next login.
-- Pretix `is_staff` set manually via pretix's admin UI will be overwritten on the next Discourse login. To grant staff access, add the user to the Discourse group.
 
 #### Step 13: Team sync (within a database transaction)
 
@@ -212,8 +205,8 @@ Team.objects.filter(organizer=ORGANIZER, name__in=expected_team_names)
 ```
 
 **Add to teams:**
-- For each regex-captured city, compute the expected team name `Ansible Meetup Organisers - {City}`.
-- Reject login before user provisioning if any matching group has no Pretix team under the configured organizer.
+- For each regex-captured city slug, resolve the exact canonical team name from `CITY_TEAM_NAME_BY_SLUG` and require exactly one team with that name.
+- Reject the organizer login before user provisioning if the organizer setting is missing/invalid or any group has no unique Pretix team.
 - Query pretix for teams matching those exact names **within the configured organizer**.
 - Add the user to each found team (idempotent — `team.members` is a simple M2M; `add()` is safe to call repeatedly).
 - A missing claimed team rejects login before user provisioning; no partial city access is granted.
@@ -235,7 +228,7 @@ Team.objects.filter(organizer=ORGANIZER, name__in=expected_team_names)
 ### 3.3 Backend Visibility
 
 The "Log in with Discourse" button appears on pretix's login page **only if** all of the following are true:
-- `DISCOURSE_URL` is configured (non-empty) and uses HTTPS. HTTP is accepted only when `allow_http=true` and the host is `localhost` or a loopback address.
+- `DISCOURSE_URL` is configured and uses HTTPS, or HTTP for localhost/loopback development.
 - `DISCOURSE_SECRET` is configured (non-empty) and at least 32 characters.
 - `API_KEY` is configured (non-empty).
 
@@ -334,13 +327,12 @@ All configuration is read from pretix's `pretix.cfg` file (INI format) under the
 
 | Key                      | Required | Default              | Description                                      |
 |--------------------------|----------|----------------------|--------------------------------------------------|
-| `url`                    | Yes      | —                    | Discourse instance base URL. **Must be HTTPS** (HTTP is allowed only for localhost/loopback development when `allow_http=true`). |
+| `url`                    | Yes      | —                    | Discourse instance base URL. **Must be HTTPS** (HTTP is allowed only for localhost/loopback development). |
 | `sso_secret`             | Yes      | —                    | Shared secret for DiscourseConnect HMAC signing. **Minimum 32 characters.** |
 | `api_key`                | Yes      | —                    | Discourse Admin API key for moderation enrichment. **Required and must work** — missing credentials hide the backend; API request failures reject login. |
 | `api_username`           | No       | `system`             | Discourse username for API requests.             |
-| `organizer`              | Yes      | —                    | Pretix organizer slug. Team queries are scoped to this organizer. Required because pretix Team names are not globally unique. |
-| `api_timeout`            | No       | `10`                 | Timeout in seconds for Discourse Admin API calls. |
-| `allow_http`             | No       | `false`              | Allow HTTP only for `localhost`, `127.0.0.1`, or `::1`. |
+| `organizer`              | Required for organiser claims | — | Pretix organizer slug. Team queries are scoped to this organizer. Attendee login does not require organizer team configuration. |
+| `api_timeout`            | No       | `10`                 | Timeout in seconds for Discourse Admin API calls; must be an integer from 1 to 60. |
 
 Example `pretix.cfg` section:
 
@@ -353,7 +345,7 @@ api_username = system
 organizer = ansible-meetups
 ```
 
-Group policy is fixed in code: `meetup-staff` grants site-wide staff access, and only `^meetup-organisers-([a-z]+)$` claims map to city teams. `require_2fa=true` is always sent and cannot be disabled.
+Group policy is fixed in code: only exact `^meetup-organisers-([a-z]+)$` claims present in `CITY_TEAM_NAME_BY_SLUG` map to city teams. That mapping duplicates the tooling repo's `CITIES` registry and is a release contract: add every city slug and exact canonical Pretix team name in both repositories before provisioning. The hardcoded Pretix-only team `Ansible Meetup Staff` is the other privileged class; its membership is never synchronized from Discourse. `require_2fa=true` is always sent and cannot be disabled.
 
 ### 4.5 Data model
 
@@ -361,10 +353,10 @@ The plugin **does not define its own database models**. It operates on pretix's 
 
 | Model          | How used | Verified details |
 |----------------|----------|------------------|
-| `User`         | Created/updated via `get_or_create_for_backend()`. Fields: `email`, `fullname`, `is_staff` (boolean, grants site-wide admin access), auth backend linkage (`discourse` + `external_id`). | `is_staff` gates the `staff_member_required` decorator. `get_or_create_for_backend` always force-updates email (hardcoded in pretix). |
-| `Team`         | Looked up by exact name **scoped to an organizer** (`ForeignKey` to `Organizer`). User added/removed via M2M `members` relation (simple M2M, no through table). Plugin never creates or deletes teams. | Team names are NOT globally unique. `members.add()` / `remove()` are idempotent. |
-| `Organizer`    | Looked up by slug from config `organizer` key. Used to scope all Team queries. | |
-| Django Session | Stores `discourse_sso_nonce` and `discourse_sso_nonce_created` for replay protection. | |
+| `User`         | Created/updated via `get_or_create_for_backend()`. Fields: `email`, `fullname`, Pretix-owned `is_staff`, auth backend linkage (`discourse` + `external_id`). | `is_staff` is never changed by this plugin. |
+| `Team`         | Looked up by city slug **scoped to an organizer** (`ForeignKey` to `Organizer`). User added/removed via M2M `members` relation. The tooling provisioner creates and reconciles teams. | Team names are not globally unique. |
+| `Organizer`    | Looked up by slug from config `organizer` key for organizer claims. | Missing/invalid configuration blocks organizer claims only. |
+| Django Session/cache | The session stores nonce and timestamp; a shared Django cache backend atomically prevents nonce replay across concurrent callbacks. Production deployments must use a cache shared by all Pretix workers. | |
 
 ### 4.6 URL routing
 
@@ -389,14 +381,15 @@ These are requirements that the prototype either skipped entirely or handled min
 
 ### 5.1 Configuration validation
 
-All validation runs at module import time. If any required check fails, the auth backend sets `visible = False` — it does not appear on the login page. This is the fail-secure posture: misconfiguration disables the plugin rather than degrading silently.
+The backend reads one validated settings object at module import time. Invalid Discourse URL, SSO secret, API credentials, or API timeout hides the backend. Missing or invalid Pretix organizer configuration blocks only organizer claims; valid attendee logins remain available when the Discourse security check succeeds.
 
 | Requirement | Behavior on failure |
 |---|---|
-| `url` must be HTTPS (or loopback HTTP with `allow_http=true`) | Backend invisible. Log ERROR: "Discourse URL must use HTTPS." |
+| `url` must be HTTPS (or loopback HTTP for local development) | Backend invisible. Log ERROR with the invalid setting. |
 | `sso_secret` must be ≥ 32 characters | Backend invisible. Log ERROR: "SSO secret too short (minimum 32 characters)." |
 | `api_key` missing | Backend invisible and an error is logged. |
-| `organizer` must be configured and resolve to an existing Organizer | Backend invisible. Log ERROR: "Organizer '{slug}' not found." |
+| Organizer setting missing/invalid or configured organizer does not exist | Reject organizer claims before user provisioning; attendee claims may proceed. |
+| `api_timeout` is not an integer from 1 through 60 | Backend invisible. |
 | Admin API credentials rejected or unavailable | Login rejected; no user provisioning or session creation occurs. |
 | Privileged callback lacks `confirmed_2fa=true` | Login rejected before user provisioning. |
 | Claimed organiser city has no matching Pretix team | Login rejected before user provisioning. |
@@ -408,14 +401,13 @@ All validation runs at module import time. If any required check fails, the auth
 | Login initiated              | INFO    | Return URL                                                   |
 | SSO callback received        | DEBUG   | (No PII — just "callback received")                         |
 | Rejection (any R1-R14)       | Per [Rejection Matrix](#34-rejection-matrix) | Per matrix |
-| Identity extracted           | INFO    | `external_id`, username, number of groups, is_staff (from group), is_privileged |
+| Identity extracted           | INFO    | `external_id`, username, organizer group count |
 | Enrichment API call          | DEBUG   | URL (without API key), response status code                  |
 | User provisioned (new)       | INFO    | `external_id`, email                                         |
 | User updated (existing)      | DEBUG   | `external_id`, fields changed                                |
-| `is_staff` changed           | WARNING | `external_id`, old value → new value, staff group name       |
 | Team added                   | INFO    | `external_id`, team name                                     |
 | Team removed                 | INFO    | `external_id`, team name                                     |
-| Team not found               | WARNING | Expected team name, city                                     |
+| Team not found or ambiguous  | ERROR   | Claimed city slugs and configured organizer                  |
 | Config validation             | ERROR or WARNING | Per [Section 5.1](#51-configuration-validation)         |
 
 **PII handling:** Log `external_id` and `username` freely (they are public Discourse identifiers). Log `email` only on user creation. Never log the SSO payload, nonces, secrets, or API keys.
@@ -430,15 +422,15 @@ The rebuild must include:
 - Signature verification: valid, tampered payload, tampered signature, empty, missing, trailing whitespace.
 - Nonce: valid, missing from session, mismatched, already consumed (replay), expired (>10 min).
 - Payload decoding: valid, invalid base64, invalid UTF-8, missing fields, `failed=true`.
-- Group parsing: exact `meetup-staff`, exact `meetup-organisers-london`, malformed suffixes, non-approved groups, mixed case, and automatic Discourse groups.
-- City normalization: a lowercase alphabetic slug (for example, `london`) resolves to the title-cased city/team name; hyphens and mixed case are rejected as group claims.
-- 2FA enforcement: exact positive `confirmed_2fa=true` for privileged users; missing/false claim rejected; unprivileged users do not require a 2FA assertion.
+- Group parsing: exact `meetup-organisers-london`, malformed suffixes, unrelated groups, mixed case, and automatic Discourse groups.
+- City/team mapping: lowercase slug resolves through the explicit constant to exactly one provisioned Pretix team; unknown, missing, or duplicate team rejects organizer login; no `.title()` derivation.
+- 2FA enforcement: exact positive `confirmed_2fa=true` for city organisers and existing Pretix staff-team members; missing/false claim rejected.
 - RTBF detection: email ending with `@anonymized.invalid`, normal email, edge cases.
 - Enrichment API: HTTP 200 with correct fields, 200 with missing fields, 401, 403, 500, timeout, invalid JSON.
 - Enrichment field parsing: `silenced_till` present vs absent and `suspended_till` present vs absent.
 - Policy enforcement: each condition independently, combined conditions, privileged vs non-privileged.
-- Team sync: add to matching team, idempotent re-add, remove stale managed teams, missing team rejects login, organizer scoping.
-- `is_staff` sync: promotion via group membership, demotion via group removal, no change, user not in staff group.
+- Team sync: add to matching city team, idempotent re-add, remove stale city teams, missing team rejects organizer login, organizer scoping; Pretix staff-team membership remains admin-managed.
+- Pretix `is_staff` remains unchanged for every Forum group claim; existing members of `Ansible Meetup Staff` require the signed 2FA assertion.
 - Email conflict handling.
 - Config validation: each validation rule independently.
 
@@ -480,7 +472,7 @@ These assumptions have been verified against Discourse and pretix source code.
 |---|---|
 | **`external_id` in SSO provider mode is the Discourse user's internal database ID.** | Confirmed: `sso.external_id = current_user.id.to_s` in `discourse_connect_provider.rb:80`. |
 | **`groups` payload is comma-separated group names.** | Confirmed: `current_user.groups.pluck(:name).join(",")` in `discourse_connect_provider.rb:83`. |
-| **`groups` includes automatic Discourse groups.** | Confirmed: includes `trust_level_0`, `staff`, `everyone`, `admins`, etc. The plugin retains only exact `meetup-staff` and full regex matches for `meetup-organisers-[a-z]+`. |
+| **`groups` includes automatic Discourse groups.** | Confirmed: includes `trust_level_0`, `staff`, `everyone`, `admins`, etc. The plugin retains only full regex matches for `meetup-organisers-[a-z]+`. |
 | **Suspended users cannot complete SSO.** | Confirmed: `current_user` returns `nil` for suspended users in `default_current_user_provider.rb`. The SSO provider redirects to login — they never reach pretix. |
 | **Silenced users CAN complete SSO.** | Confirmed: silencing restricts posting, not authentication. The enrichment API check for `silenced_till` is the only defense. |
 | **Anonymized users cannot complete SSO.** | Confirmed: `UserAnonymizer` destroys `single_sign_on_record`, `oauth2_user_infos`, `user_associated_accounts`, `api_keys`, `user_auth_tokens`. The user cannot log in to Discourse at all. |
@@ -497,7 +489,7 @@ These assumptions have been verified against Discourse and pretix source code.
 
 | Assumption | Risk if wrong |
 |---|---|
-| **Pretix teams are pre-created manually by an admin.** The plugin never creates teams. | A new meetup city requires someone to manually create the pretix team. The plugin logs a WARNING when a city maps to a nonexistent team. |
+| **The provisioner owns group/team creation.** | The tooling script creates and reconciles them from the registered city list; the auth plugin only validates and synchronizes membership. |
 | **`pretix.cfg` is the only config source.** Module-level `config.get()` reads from the INI file. | Environment variable overrides or secrets managers are not supported. |
 | **One Discourse instance per pretix deployment.** Config is global. | Multi-tenant deployments are not supported (by design — see Q4). |
 | **The `return_sso_url` in the SSO payload is trusted by Discourse.** | Discourse must be configured to accept redirects to the pretix domain. |
@@ -545,7 +537,7 @@ When `get_or_create_for_backend` raises `EmailAddressTakenError`, the user is lo
 | Discourse outage blocks all pretix logins | Medium | High — no organizer can log in | Both the SSO flow and the enrichment API depend on Discourse. Document this dependency. Consider a break-glass local admin account. |
 | Discourse API key is rotated without updating pretix config | Medium | High — enrichment fails, all users fail-closed (R9) | Monitoring/alerting on enrichment API errors (R14 specifically). Document the key rotation procedure. |
 | SSO secret mismatch after rotation | Low | High — all logins fail with signature mismatch (R2) | Coordinate secret rotation procedure. Consider supporting dual secrets during rotation. |
-| Pretix team not created for a new city | High | Medium — host can log in but has no team/permissions | Plugin logs WARNING when a city maps to a nonexistent team. Document the operational procedure. |
+| Pretix team missing or duplicated for a claimed city | High | High — login is rejected before user provisioning | Provisioning creates/reconciles every registered city team. The auth plugin fails closed if an organizer claim has no unique mapped team. |
 | Config changes require process restart | Guaranteed | Low | Document clearly. |
 
 ### 7.2 Security risks
@@ -553,7 +545,7 @@ When `get_or_create_for_backend` raises `EmailAddressTakenError`, the user is lo
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
 | SSO payload logged in web server access logs (GET params contain PII) | High | Medium — email/username in access logs | Inherent to the DiscourseConnect protocol (GET-based). Configure web server to avoid logging query strings for the callback URL. Ensure log rotation and access controls. |
-| Group name injection (attacker creates a matching organiser group) | Low | Medium — access to an existing matching Pretix team | Restrict group creation to Discourse admins; reject any claimed city with no exact Pretix team. |
+| Unapproved organiser group claim | Low | Medium — access to a matching city team | Forum admins manage organiser membership; the plugin requires an exact group name and a unique corresponding team. |
 | Silenced user accesses pretix between silencing and next login | Medium | Low — silenced users have limited Discourse permissions but may still have pretix team access | Acceptable given login-time-only sync. Future: session invalidation or webhook-driven sync. |
 
 ---
@@ -562,15 +554,9 @@ When `get_or_create_for_backend` raises `EmailAddressTakenError`, the user is lo
 
 All design decisions are resolved. No open questions remain.
 
-### Q1: `is_staff` sync mechanism — DECIDED
+### Q1: Pretix staff permissions — DECIDED
 
-**Decision:** Use the hardcoded `meetup-staff` group for Pretix staff access. The Discourse `admin` flag is unrelated and ignored.
-
-The Discourse `admin` flag is not used. Staff access is granted only to members of the dedicated group. This decouples Discourse forum administration from pretix infrastructure access. `is_staff` grants **site-wide admin access** across all organizers in pretix (verified in pretix source).
-
-**Bootstrap procedure:** Before enabling the plugin, ensure at least one user is in the `meetup-staff` Discourse group. Alternatively, create an initial pretix superuser via `python manage.py createsuperuser` before switching to Discourse SSO. If no one is in the staff group, no one can access the pretix admin panel.
-
-The `meetup-staff` Discourse group should have owners-only visibility to avoid exposing the list of privileged users.
+Pretix administrators alone grant or revoke `is_staff` through Pretix configuration and manage membership of the Pretix-only `Ansible Meetup Staff` team. The Discourse auth plugin does not consume a Forum staff group, does not inspect Discourse's `admin` flag, and does not mutate Pretix staff status. Members of the staff team must pass DiscourseConnect's signed 2FA assertion. Create a Pretix break-glass administrator before enabling the SSO backend.
 
 ---
 
@@ -588,14 +574,7 @@ When the Discourse Admin API enrichment call fails for any reason (network error
 
 ### Q3: Team provisioning — DECIDED
 
-**Decision:** Teams are pre-created manually by pretix administrators.
-
-The plugin never creates or deletes teams. When a Discourse group maps to a city that has no corresponding pretix team, the plugin logs a WARNING and the user receives no team assignment for that city.
-
-**Operational procedure for new cities:**
-1. Create the Discourse group `meetup-organisers-tokyo` and matching Pretix team `Ansible Meetup Organisers - Tokyo`.
-2. Create the pretix team (e.g., `Ansible Meetup Organisers - Tokyo`) within the configured organizer and set its permissions.
-3. Add users to the Discourse group — team membership syncs on their next login.
+The tooling provisioning script creates and reconciles Forum groups, categories, city teams, and the Pretix-only `Ansible Meetup Staff` team. For a new city, operators must update both the tooling repo's explicit `CITIES` record and this repo's `CITY_TEAM_NAME_BY_SLUG` mapping, deploy both, then run provisioning. The script owns team permissions and event scope; Pretix admins alone manage staff-team members. The auth plugin rejects organizer claims unless the corresponding city team exists under the configured Pretix organizer. Attendee logins do not require a city team.
 
 ---
 
@@ -629,9 +608,8 @@ These items require human decisions or actions before the plugin can be deployed
 
 - [ ] **Enable DiscourseConnect Provider** in Discourse admin → Settings → Login. The site setting `enable_discourse_connect_provider` must be `true`.
 - [ ] **Set the SSO secret** in Discourse to match the `sso_secret` in `pretix.cfg`. Minimum 32 characters, cryptographically random.
-- [ ] **Create `meetup-staff`** with owners-only visibility and add initial staff users before enabling the plugin.
 - [ ] **Restrict group creation** to Discourse admins. A user who can create a matching organiser group for an existing Pretix team can claim that team's access.
-- [ ] **Create `meetup-organisers-{city}` groups** only for approved cities, and ensure each has a corresponding Pretix team.
+- [ ] Run the tooling provisioner to create Forum groups and Pretix teams from its explicit city registry.
 - [ ] **Generate a Discourse Admin API key** with "All Users" scope. Record it for `pretix.cfg`.
 - [ ] **Verify `groups` is in the DiscourseConnect provider claims.** In Discourse admin → Settings → DiscourseConnect, check that `discourse_connect_provider_claims` includes `groups`. Without this, the SSO payload will not include group memberships and team sync will silently produce no matches.
 
@@ -639,14 +617,14 @@ These items require human decisions or actions before the plugin can be deployed
 
 - [ ] **Create a break-glass local admin account** via `python manage.py createsuperuser`. This provides emergency access if Discourse is unavailable.
 - [ ] **Determine the organizer slug** — run `Organizer.objects.values_list('slug', flat=True)` in the pretix shell to list available organizers. Set this as `organizer` in `pretix.cfg`.
-- [ ] **Create Pretix teams** for each approved city using `Ansible Meetup Organisers - {City}`. Configure appropriate event permissions.
+- [ ] Confirm the tooling provisioner created the city teams and scoped their permissions.
 - [ ] **Configure `pretix.cfg`** with all required values. See [Appendix C](#appendix-c-config-quick-reference).
 - [ ] **Restart pretix** after config changes (config is loaded at module import time).
 
 ### 9.3 Verification steps
 
 - [ ] Confirm the "Log in with Discourse" button appears on the pretix login page. If it doesn't, check `pretix.log` for ERROR-level config validation messages.
-- [ ] Test login with a user in `meetup-staff` — verify `is_staff` is set.
+- [ ] Confirm Pretix admin configuration controls `is_staff` and only Pretix admins manage membership in `Ansible Meetup Staff`.
 - [ ] Test login with a user in `meetup-organisers-london` — verify team membership.
 - [ ] Test a matching organiser group without a Pretix team — login must fail before user provisioning.
 - [ ] Test a privileged response without `confirmed_2fa=true` — login must be rejected.
@@ -663,13 +641,15 @@ These are security tradeoffs the operator should understand and accept:
 
 1. **Fail-secure posture:** If the Discourse Admin API is unreachable (network issues, Discourse downtime, API key rotation), **all logins are blocked**. This is by design — security over availability. The break-glass local admin account provides emergency access. If this tradeoff is unacceptable, the code must be modified.
 
-2. **`is_staff` exclusive ownership:** The plugin overwrites `is_staff` on every Discourse login based on `meetup-staff` membership. Manual `is_staff` grants via pretix's admin UI will be reverted on the user's next login. Staff access must be managed through the Discourse group.
+2. **Pretix staff ownership:** `is_staff` is controlled in Pretix configuration only. This plugin never grants or revokes it based on Forum claims.
 
 3. **Email conflict lockout:** If a user changes their Discourse email to one already claimed by another pretix user on a different auth backend, they are locked out (`EmailAddressTakenError`). This is a pretix limitation — the email update is hardcoded and cannot be skipped by the plugin. Resolution requires admin intervention.
 
-4. **Login-time-only sync:** Team membership and staff status sync only at login. A user removed from a Discourse group retains pretix access until their session expires and they log in again. Future improvement: webhook-driven sync or session invalidation middleware.
+4. **Login-time-only sync:** Organizer team membership syncs at login. A user removed from an organizer group retains team access until their next login or manual removal in Pretix. Pretix staff-team and `is_staff` membership remain administrator-managed.
 
-5. **Silenced users with active sessions:** A user silenced in Discourse after their last pretix login retains their pretix session. The silenced check only runs during the enrichment call at login time. Same future improvement as item 4.
+5. **Session lifetime:** Discourse SSO sessions use a three-hour idle timeout. Pretix also enforces its configured absolute session limit (12 hours in the current supported Pretix version); the plugin disables Pretix's "keep me logged in" behavior. These server-wide limits are Pretix deployment settings and cannot be changed through the organizer API used by `provision_environment.py`.
+
+6. **Silenced users with active sessions:** A user silenced in Discourse after their last pretix login retains their pretix session. The silenced check only runs during the enrichment call at login time. Same future improvement as item 4.
 
 ---
 
@@ -754,5 +734,4 @@ organizer = ansible-meetups
 # OPTIONAL (defaults shown)
 api_username = system
 api_timeout = 10
-allow_http = false
 ```
