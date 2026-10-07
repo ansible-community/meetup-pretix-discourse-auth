@@ -116,22 +116,24 @@ def return_view(request):
         return redirect(reverse(_LOGIN_URL))
 
     # Step 6: Group parsing
-    groups_set = {g.strip() for g in parsed_sso.get('groups', '').split(',') if g.strip()}
-    groups_lower = {g.lower() for g in groups_set}
-
-    # Trust only the named staff group and exact organiser city-group shape.
+    # Discard every claim except the exact staff name and exact city-group form.
+    allowed_groups = {
+        group.strip().lower()
+        for group in parsed_sso.get('groups', '').split(',')
+        if group.strip().lower() == STAFF_GROUP or ORGANIZERS_GROUP_RE.fullmatch(group.strip().lower())
+    }
     organizer_groups = [
-        match for group in groups_set
-        if (match := ORGANIZERS_GROUP_RE.fullmatch(group.lower()))
+        match for group in allowed_groups
+        if (match := ORGANIZERS_GROUP_RE.fullmatch(group))
     ]
     cities = [match.group(1).title() for match in organizer_groups]
 
-    is_staff_group_member = STAFF_GROUP in groups_lower
+    is_staff_group_member = STAFF_GROUP in allowed_groups
     privileged = is_staff_group_member or bool(organizer_groups)
 
     logger.info(
         "Identity extracted: external_id=%s, username=%s, groups=%d, is_staff=%s, privileged=%s",
-        external_id, username, len(groups_set), is_staff_group_member, privileged
+        external_id, username, len(allowed_groups), is_staff_group_member, privileged
     )
 
     # Step 7: Require affirmative proof that DiscourseConnect completed the
