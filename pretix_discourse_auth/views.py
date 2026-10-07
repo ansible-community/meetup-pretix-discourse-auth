@@ -163,7 +163,8 @@ def return_view(request):
         resp = requests.get(
             admin_url,
             headers={'Api-Key': API_KEY, 'Api-Username': API_USER},
-            timeout=API_TIMEOUT
+            timeout=API_TIMEOUT,
+            allow_redirects=False,
         )
 
         if resp.status_code == 200:
@@ -171,6 +172,11 @@ def return_view(request):
                 raw_data = resp.json()
             except ValueError:
                 logger.error("Enrichment API returned invalid JSON, url=%s", admin_url)
+                messages.error(request, _('Could not verify security status with Discourse. Please try again later.'))
+                return redirect(reverse(_LOGIN_URL))
+
+            if not isinstance(raw_data, dict):
+                logger.error("Enrichment API returned a non-object response, url=%s", admin_url)
                 messages.error(request, _('Could not verify security status with Discourse. Please try again later.'))
                 return redirect(reverse(_LOGIN_URL))
 
