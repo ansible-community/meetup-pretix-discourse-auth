@@ -180,6 +180,15 @@ def return_view(request):
                 messages.error(request, _('Could not verify security status with Discourse. Please try again later.'))
                 return redirect(reverse(_LOGIN_URL))
 
+            status_fields = ('silenced_till', 'suspended_till')
+            if any(
+                field not in raw_data or raw_data[field] is not None and not isinstance(raw_data[field], str)
+                for field in status_fields
+            ):
+                logger.error("Enrichment API response is missing valid moderation fields, url=%s", admin_url)
+                messages.error(request, _('Could not verify security status with Discourse. Please try again later.'))
+                return redirect(reverse(_LOGIN_URL))
+
             api_data = raw_data
             is_silenced = bool(api_data.get('silenced_till'))
             is_suspended = bool(api_data.get('suspended_till'))
