@@ -150,14 +150,14 @@ Username and display name heuristics are **not used** — they produce false pos
 - Timeout: 10 seconds (configurable via `api_timeout`).
 - Parse response JSON once, store in a local variable. The Discourse Admin API returns the user object directly (`root: false`), so `api_data = raw_data` — no `raw_data.get('user', raw_data)` wrapper needed.
 
-**On HTTP 200, extract:**
+**On HTTP 200, validate identity and extract moderation status:** The response must contain the requested `id` and a non-empty `username`. `silenced_till` and `suspended_till` are optional; each must be a string or `null` when present. Missing moderation fields mean the user is not in that state, as Discourse omits them for ordinary users. An empty object, mismatched identity, or invalid field type is an API response failure and blocks login.
 
 | API field | Type | Interpretation |
 |-----------|------|----------------|
 | `silenced_till` | datetime or absent | **Present only when user is silenced.** If the key exists and is non-null, the user is silenced. If absent, the user is not silenced. |
 | `suspended_till` | datetime or absent | **Present only when user is suspended.** If the key exists and is non-null, the user is suspended. Note: suspended users cannot complete SSO (Discourse blocks login), so this is defense-in-depth. |
 
-**Critical implementation note:** The Discourse Admin API does **not** return boolean `silenced` or `suspended` fields. It returns `silenced_till` and `suspended_till` as datetime values, **only when the user is silenced/suspended**. Check for the presence and non-null value of these keys:
+**Critical implementation note:** The Discourse Admin API does **not** return boolean `silenced` or `suspended` fields. It returns `silenced_till` and `suspended_till` as datetime values only when the user is silenced/suspended. Validate the response identity and field types first, then check the presence and non-null value of these keys:
 
 ```
 is_silenced = bool(api_data.get('silenced_till'))
@@ -235,7 +235,7 @@ Team.objects.filter(organizer=ORGANIZER, name__in=expected_team_names)
 ### 3.3 Backend Visibility
 
 The "Log in with Discourse" button appears on pretix's login page **only if** all of the following are true:
-- `DISCOURSE_URL` is configured (non-empty) and uses HTTPS (or `allow_http=true` for local dev).
+- `DISCOURSE_URL` is configured (non-empty) and uses HTTPS. HTTP is accepted only when `allow_http=true` and the host is `localhost` or a loopback address.
 - `DISCOURSE_SECRET` is configured (non-empty) and at least 32 characters.
 - `API_KEY` is configured (non-empty).
 
@@ -257,7 +257,7 @@ Every rejection scenario in the callback flow, consolidated in one table. All re
 | R6 | 5 | Missing `external_id` or `email` | "Incomplete identity data received." | WARNING | Client IP |
 | R7 | 7 | Privileged user without signed `confirmed_2fa=true` | "Discourse did not confirm two-factor authentication." | WARNING | `external_id` |
 | R8 | 8 | Email ends with `@anonymized.invalid` | "Account blocked: Anonymized account detected." | WARNING | `external_id` |
-| R9 | 9 | Enrichment API error (any: network, timeout, non-200, invalid JSON) | "Could not verify security status with Discourse. Please try again later." | ERROR | Exception type, URL (no API key), HTTP status if available |
+| R9 | 9 | Enrichment API error (network, timeout, non-200, invalid JSON, malformed identity/field data) | "Could not verify security status with Discourse. Please try again later." | ERROR | Exception type, URL (no API key), HTTP status if available |
 | R10 | 10 | User is silenced (`silenced_till` present and non-null) | "Account blocked: Moderation (silenced)." | WARNING | `external_id` |
 | R11 | 10 | User is suspended (`suspended_till` present and non-null) | "Account blocked: Moderation (suspended)." | WARNING | `external_id` |
 | R12 | 11 | Claimed organiser group has no matching team | "Could not verify organiser access with Pretix. Please contact an administrator." | ERROR | Missing team names, organizer slug |
@@ -334,13 +334,13 @@ All configuration is read from pretix's `pretix.cfg` file (INI format) under the
 
 | Key                      | Required | Default              | Description                                      |
 |--------------------------|----------|----------------------|--------------------------------------------------|
-| `url`                    | Yes      | —                    | Discourse instance base URL. **Must be HTTPS** (unless `allow_http=true`). |
+| `url`                    | Yes      | —                    | Discourse instance base URL. **Must be HTTPS** (HTTP is allowed only for localhost/loopback development when `allow_http=true`). |
 | `sso_secret`             | Yes      | —                    | Shared secret for DiscourseConnect HMAC signing. **Minimum 32 characters.** |
 | `api_key`                | Yes      | —                    | Discourse Admin API key for moderation enrichment. **Required and must work** — missing credentials hide the backend; API request failures reject login. |
 | `api_username`           | No       | `system`             | Discourse username for API requests.             |
 | `organizer`              | Yes      | —                    | Pretix organizer slug. Team queries are scoped to this organizer. Required because pretix Team names are not globally unique. |
 | `api_timeout`            | No       | `10`                 | Timeout in seconds for Discourse Admin API calls. |
-| `allow_http`             | No       | `false`              | Allow non-HTTPS Discourse URL. **For local development only.** |
+| `allow_http`             | No       | `false`              | Allow HTTP only for `localhost`, `127.0.0.1`, or `::1`. |
 
 Example `pretix.cfg` section:
 
@@ -393,7 +393,7 @@ All validation runs at module import time. If any required check fails, the auth
 
 | Requirement | Behavior on failure |
 |---|---|
-| `url` must be HTTPS (or `allow_http=true`) | Backend invisible. Log ERROR: "Discourse URL must use HTTPS." |
+| `url` must be HTTPS (or loopback HTTP with `allow_http=true`) | Backend invisible. Log ERROR: "Discourse URL must use HTTPS." |
 | `sso_secret` must be ≥ 32 characters | Backend invisible. Log ERROR: "SSO secret too short (minimum 32 characters)." |
 | `api_key` missing | Backend invisible and an error is logged. |
 | `organizer` must be configured and resolve to an existing Organizer | Backend invisible. Log ERROR: "Organizer '{slug}' not found." |
@@ -511,7 +511,7 @@ These assumptions have been verified against Discourse and pretix source code.
 | **Discourse returns duplicate group names.** | Groups are collected into a `set`; duplicates are eliminated. | NONE — handled. |
 | **Two users log in simultaneously, both added to the same team.** | `team.members.add()` is idempotent. No conflict. | NONE — handled. |
 | **Privileged SSO response omits `confirmed_2fa`.** | Login is rejected before user provisioning. | NONE — fail-closed. |
-| **Discourse API returns 200 but `silenced_till` key is absent.** | `api_data.get('silenced_till')` returns `None` → `bool(None)` = `False`. User is not treated as silenced. | NONE — correct: key absence means user is not silenced. |
+| **Discourse API returns 200 but `silenced_till` or `suspended_till` is absent.** | Missing moderation fields mean the user is not in that moderation state. The response must still include a matching user ID and a non-empty username; malformed identity or field types block login. | NONE — follows the Admin API response shape while rejecting malformed responses. |
 | **Team is renamed in pretix after user was added.** | On next login, old team name won't match expected; removal happens for the old name. The renamed team (no longer matching managed prefix) keeps the user as orphaned membership. | LOW — edge case during team administration. |
 | **Team with same name exists in a different organizer.** | Team queries are scoped to the configured `organizer`. No cross-organizer match. | NONE — handled by organizer scoping. |
 | **A matching organiser group exists without a Pretix team.** | Login is rejected before creating/updating the Pretix user. | NONE — fail-closed. |
@@ -578,7 +578,7 @@ The `meetup-staff` Discourse group should have owners-only visibility to avoid e
 
 **Decision:** Fail secure for all users (option a).
 
-When the Discourse Admin API enrichment call fails for any reason (network error, timeout, non-200 HTTP status, invalid JSON), **reject the login for all users**. The enrichment checks (silenced, suspended, 2FA) are security controls — if they cannot be verified, access is denied.
+When the Discourse Admin API enrichment call fails for any reason (network error, timeout, non-200 HTTP status, invalid JSON, or malformed identity/field data), **reject the login for all users**. This API check verifies silenced and suspended status; privileged 2FA is independently enforced through DiscourseConnect's signed `confirmed_2fa=true` assertion.
 
 **Rationale:** The "fail secure" principle takes precedence over availability. With `require_2fa` handled at the protocol layer (Step 7), the enrichment call's primary remaining purpose is the silenced/suspended check. A silenced user who gains pretix access during an API outage could access personal data (names, emails) of event attendees. This risk outweighs the inconvenience of temporary login unavailability during a Discourse API outage.
 
