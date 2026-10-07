@@ -29,8 +29,8 @@ requires = [
 ]
 
 [project.urls]
-homepage = "https://github.com/ansible-community/pretix-discource-plugin"
-repository = "https://github.com/ansible-community/pretix-discource-plugin"
+homepage = "https://github.com/ansible-community/meetup-pretix-discourse-auth"
+repository = "https://github.com/ansible-community/meetup-pretix-discourse-auth"
 
 [tool.setuptools]
 include-package-data = true

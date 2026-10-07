@@ -7,7 +7,7 @@ class PluginApp(AppConfig):
 
     class PretixPluginMeta:
         name = 'Discourse Auth'
-        author = 'Your Name'
+        author = 'gundalow'
         description = 'Discourse authentication backend for pretix'
         visible = True
         version = '1.0.0'
