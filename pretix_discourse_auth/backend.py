@@ -18,8 +18,17 @@ logger = logging.getLogger(__name__)
 ORGANIZERS_GROUP_RE = re.compile(r"^meetup-organisers-([a-z]+)$")
 ORGANISERS_GROUP_PREFIX = "meetup-organisers-"
 TEAM_NAME_PREFIX = "Ansible Meetup Organisers - "
+STAFF_TEAM_NAME = "Ansible Meetup Staff"
+CITY_TEAM_NAME_BY_SLUG = {
+    "london": "Ansible Meetup Organisers - London",
+    "barcelona": "Ansible Meetup Organisers - Barcelona",
+    "faketown": "Ansible Meetup Organisers - FakeTown",
+}
 RTBF_EMAIL_SUFFIX = "@anonymized.invalid"
 NONCE_MAX_AGE_SECONDS = 600
+AUTH_SESSION_IDLE_TIMEOUT_SECONDS = 3 * 60 * 60
+MAX_SSO_PAYLOAD_LENGTH = 16384
+DISCOURSE_USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,60}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,13 +48,17 @@ class PluginSettings:
     def load(cls) -> "PluginSettings":
         url = config.get("discourse_auth", "url", fallback="").strip()
         secret = config.get("discourse_auth", "sso_secret", fallback="")
-        api_key = config.get("discourse_auth", "api_key", fallback="")
-        api_username = config.get("discourse_auth", "api_username", fallback="system").strip()
+        api_key = config.get("discourse_auth", "api_key", fallback="").strip()
+        api_username = config.get(
+            "discourse_auth", "api_username", fallback="system"
+        ).strip()
         organizer_slug = config.get("discourse_auth", "organizer", fallback="").strip()
         errors: list[str] = []
 
         try:
-            api_timeout = int(config.get("discourse_auth", "api_timeout", fallback="10"))
+            api_timeout = int(
+                config.get("discourse_auth", "api_timeout", fallback="10")
+            )
             if not 1 <= api_timeout <= 60:
                 raise ValueError
         except ValueError:
@@ -66,23 +79,34 @@ class PluginSettings:
                     and not parsed.query
                     and not parsed.fragment
                     and (port is None or 1 <= port <= 65535)
-                    and (parsed.scheme == "https" or (parsed.scheme == "http" and local_host))
+                    and (
+                        parsed.scheme == "https"
+                        or (parsed.scheme == "http" and local_host)
+                    )
                 )
             except ValueError:
                 valid_url = False
             if not valid_url:
-                errors.append("discourse_auth.url must use HTTPS (HTTP is allowed only for localhost/loopback)")
+                errors.append(
+                    "discourse_auth.url must use HTTPS (HTTP is allowed only for localhost/loopback)"
+                )
 
-        if len(secret) < 32:
+        if len(secret) < 32 or not secret.strip():
             errors.append("discourse_auth.sso_secret must be at least 32 characters")
         if not api_key:
             errors.append("discourse_auth.api_key is required for security enrichment")
-        if not api_username:
-            errors.append("discourse_auth.api_username must not be empty")
+        if not DISCOURSE_USERNAME_RE.fullmatch(api_username):
+            errors.append(
+                "discourse_auth.api_username must be a valid Discourse username"
+            )
 
         organizer_error = None
-        if organizer_slug and not re.fullmatch(r"[a-z0-9-]+", organizer_slug):
-            organizer_error = "discourse_auth.organizer must be a valid Pretix organizer slug"
+        if organizer_slug and not re.fullmatch(
+            r"[a-z0-9](?:[a-z0-9-]{0,188}[a-z0-9])?", organizer_slug
+        ):
+            organizer_error = (
+                "discourse_auth.organizer must be a valid Pretix organizer slug"
+            )
         return cls(
             discourse_url=url.rstrip("/"),
             discourse_secret=secret,
@@ -118,7 +142,9 @@ class DiscourseAuthBackend(BaseAuthBackend):
         request.session["discourse_sso_nonce"] = nonce
         request.session["discourse_sso_nonce_created"] = time.time()
 
-        return_url = request.build_absolute_uri(reverse("plugins:pretix_discourse_auth:return"))
+        return_url = request.build_absolute_uri(
+            reverse("plugins:pretix_discourse_auth:return")
+        )
         payload = f"nonce={nonce}&return_sso_url={return_url}&require_2fa=true"
         payload_b64 = base64.b64encode(payload.encode("utf-8")).decode("utf-8")
         sig = hmac.new(
