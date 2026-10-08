@@ -10,8 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 from urllib.parse import urlencode
 
-from pretix_discourse_auth import views
-from pretix_discourse_auth import backend
+from pretix_discourse_auth import backend, views
 from pretix_discourse_auth.backend import CITY_TEAM_NAME_BY_SLUG
 
 SECRET = "test-sso-secret-that-is-long-enough-to-sign-callbacks"
