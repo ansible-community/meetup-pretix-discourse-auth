@@ -1,0 +1,39 @@
+name: Tests
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [ main, master ]
+    paths-ignore:
+      - 'pretix_discourse_auth/locale/**'
+  pull_request:
+    branches: [ main, master ]
+    paths-ignore:
+      - 'pretix_discourse_auth/locale/**'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    name: Tests
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.11
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: pyproject.toml
+      - name: Install system dependencies
+        run: sudo apt update && sudo apt install gettext
+      - name: Install pretix
+        run: uv pip install --system pretix
+      - name: Install Dependencies
+        run: uv pip install --system pytest pytest-django pytest-cov -e .
+      - name: Run callback security tests with coverage
+        run: pytest --cov=pretix_discourse_auth.backend --cov=pretix_discourse_auth.views --cov-report=term-missing --cov-fail-under=60 tests

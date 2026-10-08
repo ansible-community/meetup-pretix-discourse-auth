@@ -1,0 +1,43 @@
+[project]
+name = "pretix-discourse-auth"
+dynamic = ["version"]
+description = "Discourse authentication backend for pretix"
+readme = "README.rst"
+license = {text = "Apache"}
+keywords = ["pretix"]
+authors = [
+    {name = "gundalow", email = "john@johnrbarker.com"},
+]
+maintainers = [
+    {name = "gundalow", email = "john@johnrbarker.com"},
+]
+
+dependencies = [
+    "requests",
+]
+
+[project.entry-points."pretix.plugin"]
+pretix_discourse_auth = "pretix_discourse_auth:PretixPluginMeta"
+
+[project.entry-points."distutils.commands"]
+build = "pretix_plugin_build.build:CustomBuild"
+
+[build-system]
+requires = [
+    "setuptools",
+    "pretix-plugin-build",
+]
+
+[project.urls]
+homepage = "https://github.com/ansible-community/meetup-pretix-discourse-auth"
+repository = "https://github.com/ansible-community/meetup-pretix-discourse-auth"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.dynamic]
+version = {attr = "pretix_discourse_auth.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["pretix*"]
+namespaces = false
