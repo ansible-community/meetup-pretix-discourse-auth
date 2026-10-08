@@ -12,6 +12,7 @@ from django.core.cache import cache
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
 from django.db import transaction
+from django.http import HttpResponse
 from django.shortcuts import redirect
 from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
@@ -19,10 +20,10 @@ from pretix.base.models import Team, User
 from pretix.base.models.auth import EmailAddressTakenError
 from pretix.base.models.organizer import Organizer
 from pretix.control.views.auth import process_login
+from pretix.helpers.http import get_client_ip
 from urllib.parse import parse_qsl
 
 from .backend import (
-    AUTH_SESSION_IDLE_TIMEOUT_SECONDS,
     CITY_TEAM_NAME_BY_SLUG,
     DISCOURSE_USERNAME_RE,
     MAX_SSO_PAYLOAD_LENGTH,
@@ -39,9 +40,39 @@ logger = logging.getLogger(__name__)
 
 _LOGIN_URL = "control:auth.login"
 _EXTERNAL_ID_RE = re.compile(r"^[0-9]{1,20}$")
+_CALLBACK_RATE_LIMIT = 10
+_CALLBACK_RATE_WINDOW_SECONDS = 60
 
 
-def _reject(request, message, *, log_message=None):
+def _rate_limit_response(request, *, weight=1):
+    """Count callback attempts by trusted client IP in the shared Django cache."""
+    try:
+        client_ip = get_client_ip(request)
+        ip_hash = hashlib.sha256(client_ip.encode("utf-8")).hexdigest()
+        key = f"discourse-sso-rate:{ip_hash}"
+        cache.add(key, 0, timeout=_CALLBACK_RATE_WINDOW_SECONDS)
+        attempts = cache.incr(key, weight)
+    except Exception as exc:
+        logger.error("Callback rate limiter unavailable: %s", type(exc).__name__)
+        response = HttpResponse("Login is temporarily unavailable.", status=503)
+        response["Retry-After"] = str(_CALLBACK_RATE_WINDOW_SECONDS)
+        return response
+
+    if attempts > _CALLBACK_RATE_LIMIT:
+        logger.warning("Discourse SSO callback rate limit exceeded")
+        response = HttpResponse(
+            "Too many login attempts. Please try again later.", status=429
+        )
+        response["Retry-After"] = str(_CALLBACK_RATE_WINDOW_SECONDS)
+        return response
+    return None
+
+
+def _reject(request, message, *, log_message=None, failed_attempt=False):
+    if failed_attempt:
+        rate_limit_response = _rate_limit_response(request, weight=1)
+        if rate_limit_response is not None:
+            return rate_limit_response
     if log_message:
         logger.warning(log_message)
     messages.error(request, message)
@@ -108,6 +139,10 @@ def _parse_sso(sso):
 
 
 def return_view(request):
+    rate_limit_response = _rate_limit_response(request)
+    if rate_limit_response is not None:
+        return rate_limit_response
+
     sso = request.GET.get("sso")
     sig = request.GET.get("sig")
     if SETTINGS.errors:
@@ -138,6 +173,7 @@ def return_view(request):
             request,
             _("Signature mismatch. Authentication failed."),
             log_message="SSO signature mismatch",
+            failed_attempt=True,
         )
 
     try:
@@ -167,6 +203,7 @@ def return_view(request):
             request,
             _("Session expired or invalid nonce."),
             log_message="Invalid SSO nonce state",
+            failed_attempt=True,
         )
 
     nonce_age = time.time() - nonce_created
@@ -175,6 +212,7 @@ def return_view(request):
             request,
             _("Session expired or invalid nonce."),
             log_message="Expired or future SSO nonce",
+            failed_attempt=True,
         )
 
     # Cache.add is an atomic one-time claim on supported Django cache backends,
@@ -194,6 +232,7 @@ def return_view(request):
             request,
             _("Session expired or invalid nonce."),
             log_message="Replayed SSO nonce",
+            failed_attempt=True,
         )
 
     external_id = parsed_sso.get("external_id", "")
@@ -331,11 +370,17 @@ def return_view(request):
             log_message="Malformed Discourse security response",
         )
 
-    if data.get("silenced_till") or data.get("suspended_till"):
+    if data.get("silenced_till"):
         return _reject(
             request,
-            _("Account blocked: Moderation status prevents login."),
-            log_message="Moderated user attempted SSO",
+            _("Account blocked: Moderation (silenced)."),
+            log_message=f"R10: Silenced user attempted SSO external_id={external_id}",
+        )
+    if data.get("suspended_till"):
+        return _reject(
+            request,
+            _("Account blocked: Moderation (suspended)."),
+            log_message=f"R11: Suspended user attempted SSO external_id={external_id}",
         )
 
     organizer = None
@@ -430,5 +475,7 @@ def return_view(request):
         )
 
     response = process_login(request, user, keep_logged_in=False)
-    request.session.set_expiry(AUTH_SESSION_IDLE_TIMEOUT_SECONDS)
+    # Pretix enforces the configured relative and absolute session timeouts.
+    # Keep the browser cookie session-scoped so it is not persistent after close.
+    request.session.set_expiry(0)
     return response

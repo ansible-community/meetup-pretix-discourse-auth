@@ -135,7 +135,7 @@ If `external_id` or `email` is missing/empty, reject.
 
 For every organizer claim, existing city organiser-team member, Pretix staff-team member, or Pretix `is_staff` user, require `confirmed_2fa=true` from the HMAC-verified DiscourseConnect response. Reject when the field is missing or not exactly `"true"`. Do not use `no_2fa_methods`, Pretix team configuration, or Admin API account configuration as substitutes for proof that the current authentication passed the challenge.
 
-#### Step 8: RTBF detection (heuristic)
+#### Step 8: RTBF detection
 
 **Constant:** `RTBF_EMAIL_SUFFIX = "@anonymized.invalid"`
 
@@ -222,7 +222,7 @@ Team.objects.filter(organizer=ORGANIZER, name__in=expected_team_names)
 #### Step 14: Login
 
 - Call pretix's `process_login(request, user, keep_logged_in=False)`.
-- Session is browser-scoped (expires on browser close).
+- The session cookie is browser-scoped (expires on browser close). Pretix enforces its configured relative idle timeout and absolute session limit independently.
 - Post-login redirect: `process_login` calls `backend.get_next_url(request)` which uses `request.GET.get("next")`. Pretix validates this against `url_has_allowed_host_and_scheme(next_url, allowed_hosts=None)`, which restricts to the current host — **no open redirect risk** (verified in pretix source).
 
 ### 3.3 Backend Visibility
@@ -236,7 +236,7 @@ If any condition is not met, the backend is invisible — pretix falls through t
 
 ### 3.4 Rejection Matrix
 
-Every rejection scenario in the callback flow, consolidated in one table. All rejections redirect to the login page with the specified user-facing message. Log fields never include secrets, nonces, or full SSO payloads.
+Every rejection scenario in the callback flow, consolidated in one table. Authentication and policy rejections redirect to the login page with the specified user-facing message. Rate-limit responses use HTTP 429, and rate-limiter service failures use HTTP 503. Log fields never include secrets, nonces, or full SSO payloads.
 
 | ID | Step | Condition | User message | Log level | Log fields |
 |----|------|-----------|-------------|-----------|------------|
@@ -256,6 +256,8 @@ Every rejection scenario in the callback flow, consolidated in one table. All re
 | R12 | 11 | Claimed organiser group has no matching team | "Could not verify organiser access with Pretix. Please contact an administrator." | ERROR | Missing team names, organizer slug |
 | R13 | 11 | `EmailAddressTakenError` during user provisioning | "Email conflict: Another user with this email exists. Please contact an administrator." | WARNING | `external_id`, email |
 | R14 | 9 | API returns 401/403 (bad/revoked API key) | Same as R9 | **ERROR** | Additionally: "API key may be invalid or revoked" |
+| R15 | 1 | More than 10 weighted callback attempts from one client IP in 60 seconds | HTTP 429: "Too many login attempts. Please try again later." | WARNING | No IP or authentication payload data |
+| R16 | 1 | Shared cache rate limiter unavailable | HTTP 503: "Login is temporarily unavailable." | ERROR | Exception type |
 
 **Design principle:** Every rejection is logged. Every API/config error fails secure (denies access). There is no "silently continue with defaults" path — if a security check cannot be completed, access is denied.
 
@@ -420,17 +422,20 @@ The rebuild must include:
 
 **Unit tests (mocked external dependencies):**
 - Signature verification: valid, tampered payload, tampered signature, empty, missing, trailing whitespace.
-- Nonce: valid, missing from session, mismatched, already consumed (replay), expired (>10 min).
+- Nonce: valid, missing from session, mismatched, already consumed (replay), expired (>10 min), and future-dated.
 - Payload decoding: valid, invalid base64, invalid UTF-8, missing fields, `failed=true`.
 - Group parsing: exact `meetup-organisers-london`, malformed suffixes, unrelated groups, mixed case, and automatic Discourse groups.
 - City/team mapping: lowercase slug resolves through the explicit constant to exactly one provisioned Pretix team; unknown, missing, or duplicate team rejects organizer login; no `.title()` derivation.
 - 2FA enforcement: exact positive `confirmed_2fa=true` for city organisers and existing Pretix staff-team members; missing/false claim rejected.
 - RTBF detection: email ending with `@anonymized.invalid`, normal email, edge cases.
 - Enrichment API: HTTP 200 with correct fields, 200 with missing fields, 401, 403, 500, timeout, invalid JSON.
-- Enrichment field parsing: `silenced_till` present vs absent and `suspended_till` present vs absent.
+- Enrichment field parsing: `silenced_till` present vs absent and `suspended_till` present vs absent; each moderation reason is shown to the user and recorded distinctly in logs; malformed field values fail closed.
 - Policy enforcement: each condition independently, combined conditions, privileged vs non-privileged.
 - Team sync: add to matching city team, idempotent re-add, remove stale city teams, missing team rejects organizer login, organizer scoping; Pretix staff-team membership remains admin-managed.
 - Pretix `is_staff` remains unchanged for every Forum group claim; existing members of `Ansible Meetup Staff` require the signed 2FA assertion.
+- Rate limiting: the callback allows at most 10 requests per client IP in a 60-second window; signature and nonce failures have double weight; cache errors fail closed.
+- Session policy: callback login disables Pretix's persistent-session option and uses a browser-session cookie; Pretix's configured relative and absolute session limits remain in force.
+- UTF-8: signed payloads with non-ASCII display names are preserved; invalid UTF-8 payloads are rejected.
 - Email conflict handling.
 - Config validation: each validation rule independently.
 
@@ -444,8 +449,11 @@ The rebuild must include:
 
 ### 5.4 Rate limiting
 
-- Rely on pretix's existing login rate limiting if available.
-- If not, apply rate limiting on the callback endpoint: max 10 requests per IP per minute. Failed attempts (signature mismatch, nonce mismatch) should count double.
+- Apply a fixed-window rate limit to the SSO callback: at most 10 weighted attempts per client IP per 60 seconds.
+- Every callback request counts once. Signature mismatch and invalid, expired, future-dated, or replayed nonce checks count twice in total.
+- Obtain the client IP through Pretix's trusted proxy-aware `get_client_ip()` helper; do not trust arbitrary forwarded headers.
+- Store counters in the shared Django cache used by Pretix workers. If the cache is unavailable, fail closed with a temporary service error. Production deployments must use a cache backend with atomic increment support shared by every worker.
+- Return HTTP 429 with `Retry-After` when the limit is exceeded.
 
 ### 5.5 Internationalization
 

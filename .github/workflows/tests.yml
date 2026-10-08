@@ -36,4 +36,4 @@ jobs:
       - name: Install Dependencies
         run: uv pip install --system pytest pytest-django pytest-cov -e .
       - name: Run callback security tests with coverage
-        run: pytest --cov=pretix_discourse_auth.backend --cov=pretix_discourse_auth.views --cov-report=term-missing --cov-fail-under=45 tests
+        run: pytest --cov=pretix_discourse_auth.backend --cov=pretix_discourse_auth.views --cov-report=term-missing --cov-fail-under=60 tests

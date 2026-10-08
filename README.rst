@@ -8,7 +8,8 @@ Discourse authentication backend for pretix
 Access policy
 -------------
 
-Any valid Forum account can sign in to Pretix as an attendee. Only exact
+Any non-suspended, non-silenced, non-anonymized Forum account can sign in to
+Pretix as an attendee. Only exact
 ``meetup-organisers-{city}`` claims that resolve through the plugin's explicit
 city/team mapping receive city team membership. Pretix admins alone manage the
 ``Ansible Meetup Staff`` team and Pretix's site-wide ``is_staff`` flag; Forum
@@ -18,8 +19,14 @@ for city organisers, Pretix staff-team members, and Pretix staff accounts.
 Every login also requires a working Discourse Admin API key so the plugin can
 reject silenced or suspended accounts. Organizer team configuration errors block
 the affected organizer login; users without organizer claims can still sign in
-as attendees. Sessions created by this backend expire after three hours of
-inactivity, with Pretix's absolute session limit still applying.
+as attendees. Moderation rejections identify whether an account is silenced or
+suspended in the login message and Pretix log. The SSO callback is limited to 10
+weighted attempts per client IP per 60 seconds; signature and nonce failures
+count twice. It uses Pretix's proxy-aware IP handling and shared Django cache,
+and rejects logins temporarily if that cache is unavailable. Production workers
+must share a cache backend that supports atomic increments. SSO cookies expire
+when the browser closes; Pretix's configured idle and absolute session limits
+still apply.
 
 Development setup
 -----------------
@@ -39,7 +46,7 @@ Development setup
 
 This plugin has CI set up to enforce a few code style rules. To check locally, you need these packages installed::
 
-    pip install flake8 isort black
+    uv pip install flake8 isort black
 
 To check your plugin for rule violations, run::
 

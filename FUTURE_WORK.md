@@ -9,16 +9,13 @@ When the enrichment API detects a user is silenced/suspended, invalidate their e
 
 ## Robustness
 
-### Tighten RTBF heuristic
-The `username.startswith('anon')` check produces false positives for legitimate usernames. Use the Discourse API's anonymization metadata instead, or check for the exact `anonNNNNNN` pattern Discourse generates.
+### RTBF detection
+The callback checks the exact `@anonymized.invalid` email suffix used by Discourse anonymization. Username and display-name heuristics are intentionally not used because they can match legitimate users.
 
 ## Features
 
 ### Per-team permission mapping
 Review whether Pretix needs additional per-team permissions beyond the currently hardcoded order-read and check-in permissions provisioned by the tooling repository.
-
-### "Remember me" support
-Let users opt into persistent sessions rather than hardcoding `keep_logged_in=False`. Respect a config option for this.
 
 ### Webhook-driven sync
 Instead of only syncing at login time, subscribe to Discourse webhook events (user group changes, suspensions, anonymizations) to update pretix state in near-real-time. This closes the "stale until next login" gap.
@@ -37,16 +34,8 @@ Show SSO sync status in the pretix admin: last sync time per user, group-to-team
 
 ## Testing
 
-### Add real tests
-The test suite is a placeholder. Priority areas for test coverage:
-- Signature verification (valid, tampered, missing)
-- Nonce verification (valid, missing, replayed)
-- Group-to-city parsing edge cases
-- Team sync (add, remove, no-op, missing teams)
-- Policy enforcement (suspended, silenced, RTBF, 2FA)
-- preservation of Pretix-owned `is_staff` across Forum logins
-- API failure modes (timeout, 500, invalid JSON)
-- Email conflict handling
+### Continue security test coverage
+The callback has unit coverage for its primary signature, nonce, rate-limit, moderation, 2FA, UTF-8, and API failure decisions. Add focused unit cases when security policy changes, especially for team reconciliation and configuration validation. Keep external services mocked; live Discourse tests are not required for the callback unit suite.
 
 ### Integration test with Discourse
 Set up a test Discourse instance (or mock the SSO protocol end-to-end) to verify the full login flow, including edge cases like changed emails and group membership changes between logins.
