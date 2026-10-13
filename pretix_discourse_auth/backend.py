@@ -21,7 +21,6 @@ STAFF_TEAM_NAME = "Ansible Meetup Staff"
 CITY_TEAM_NAME_BY_SLUG = {
     "london": "Ansible Meetup Organisers - London",
     "barcelona": "Ansible Meetup Organisers - Barcelona",
-    "faketown": "Ansible Meetup Organisers - FakeTown",
 }
 RTBF_EMAIL_SUFFIX = "@anonymized.invalid"
 NONCE_MAX_AGE_SECONDS = 600

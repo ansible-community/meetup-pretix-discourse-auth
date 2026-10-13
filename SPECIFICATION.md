@@ -349,7 +349,7 @@ api_username = system
 organizer = ansible-meetups
 ```
 
-Group policy is fixed in code: only exact `^meetup-organisers-([a-z]+)$` claims present in `CITY_TEAM_NAME_BY_SLUG` map to city teams. That mapping duplicates the tooling repo's `CITIES` registry and is a release contract: add every city slug and exact canonical Pretix team name in both repositories before provisioning. The hardcoded Pretix-only team `Ansible Meetup Staff` is the other privileged class; its membership is never synchronized from Discourse. `require_2fa=true` is always sent and cannot be disabled.
+Group policy is fixed in code: only exact `^meetup-organisers-([a-z]+)$` claims present in `CITY_TEAM_NAME_BY_SLUG` map to city teams. The active mapping currently contains `london` and `barcelona`; it duplicates the tooling repo's `CITIES` registry and is a release contract. Add every new city slug and exact canonical Pretix team name in both repositories before provisioning. The hardcoded Pretix-only team `Ansible Meetup Staff` is the other privileged class; its membership is never synchronized from Discourse. `require_2fa=true` is always sent and cannot be disabled.
 
 ### 4.5 Data model
 
