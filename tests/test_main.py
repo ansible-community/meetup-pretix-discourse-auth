@@ -214,6 +214,7 @@ def test_bad_admin_api_credentials_fail_closed_before_user_creation(
     get_user.assert_not_called()
 
 
+@pytest.mark.django_db
 def test_organizer_login_resolves_team_and_requires_2fa(callback_harness, monkeypatch):
     request = make_callback(groups="meetup-organisers-london", confirmed_2fa=True)
     allow_moderation_check(monkeypatch)
@@ -479,6 +480,7 @@ def test_rate_limiter_cache_failure_fails_closed(callback_harness, monkeypatch):
     assert response.status_code == 503
 
 
+@pytest.mark.django_db
 def test_stale_city_team_membership_is_removed(callback_harness, monkeypatch):
     request = make_callback(groups="meetup-organisers-london", confirmed_2fa=True)
     allow_moderation_check(monkeypatch)
