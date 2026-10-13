@@ -28,6 +28,10 @@ must share a cache backend that supports atomic increments. SSO cookies expire
 when the browser closes; Pretix's configured idle and absolute session limits
 still apply.
 
+The moderation check uses a configured ``requests.Session`` client for the
+Discourse base URL, API headers, and timeout. Redirects are disabled so the API
+key is not forwarded to another URL.
+
 Development setup
 -----------------
 

@@ -105,7 +105,23 @@ def allow_moderation_check(monkeypatch, data=None):
         "id": int(EXTERNAL_ID),
         "username": USERNAME,
     }
-    monkeypatch.setattr(views.requests, "get", Mock(return_value=response))
+    monkeypatch.setattr(views.DiscourseApiClient, "get", Mock(return_value=response))
+
+
+def test_discourse_api_client_uses_configured_session_defaults(monkeypatch):
+    client = views.DiscourseApiClient()
+    get = Mock()
+    monkeypatch.setattr(client.session, "get", get)
+
+    client.get("/admin/users/42.json")
+
+    get.assert_called_once_with(
+        f"{client.base_url}admin/users/42.json",
+        timeout=client.timeout,
+        allow_redirects=False,
+    )
+    assert client.session.headers["Api-Key"] == views.SETTINGS.api_key
+    assert client.session.headers["Api-Username"] == views.SETTINGS.api_username
 
 
 def make_user():
@@ -171,7 +187,7 @@ def test_organizer_claim_requires_signed_2fa_before_api_or_user_writes(
     get_user = Mock()
     admin_api = Mock()
     monkeypatch.setattr(views.User.objects, "get_or_create_for_backend", get_user)
-    monkeypatch.setattr(views.requests, "get", admin_api)
+    monkeypatch.setattr(views.DiscourseApiClient, "get", admin_api)
 
     assert views.return_view(request) == ("redirect", "/login/")
     get_user.assert_not_called()
@@ -184,7 +200,7 @@ def test_bad_admin_api_credentials_fail_closed_before_user_creation(
 ):
     request = make_callback()
     response = Mock(status_code=403)
-    monkeypatch.setattr(views.requests, "get", Mock(return_value=response))
+    monkeypatch.setattr(views.DiscourseApiClient, "get", Mock(return_value=response))
     get_user = Mock()
     monkeypatch.setattr(views.User.objects, "get_or_create_for_backend", get_user)
 
@@ -238,7 +254,7 @@ def test_tampered_signed_payload_is_rejected(callback_harness, monkeypatch):
     request.GET = request.GET.copy()
     request.GET["sso"] = base64.b64encode(b"nonce=other").decode()
     admin_api = Mock()
-    monkeypatch.setattr(views.requests, "get", admin_api)
+    monkeypatch.setattr(views.DiscourseApiClient, "get", admin_api)
 
     assert views.return_view(request) == ("redirect", "/login/")
     admin_api.assert_not_called()
@@ -282,7 +298,7 @@ def test_anonymized_email_is_rejected(callback_harness, monkeypatch, email):
     get_user = Mock()
     admin_api = Mock()
     monkeypatch.setattr(views.User.objects, "get_or_create_for_backend", get_user)
-    monkeypatch.setattr(views.requests, "get", admin_api)
+    monkeypatch.setattr(views.DiscourseApiClient, "get", admin_api)
 
     assert views.return_view(request) == ("redirect", "/login/")
     get_user.assert_not_called()
@@ -308,7 +324,7 @@ def test_future_and_expired_nonces_are_rejected(
     request = make_callback()
     request.session["discourse_sso_nonce_created"] = time.time() - nonce_age
     admin_api = Mock()
-    monkeypatch.setattr(views.requests, "get", admin_api)
+    monkeypatch.setattr(views.DiscourseApiClient, "get", admin_api)
 
     assert views.return_view(request) == ("redirect", "/login/")
     admin_api.assert_not_called()
@@ -326,7 +342,7 @@ def test_replayed_nonce_is_rejected(callback_harness, monkeypatch):
         ),
     )
     admin_api = Mock()
-    monkeypatch.setattr(views.requests, "get", admin_api)
+    monkeypatch.setattr(views.DiscourseApiClient, "get", admin_api)
 
     assert views.return_view(request) == ("redirect", "/login/")
     admin_api.assert_not_called()
@@ -394,7 +410,7 @@ def test_privileged_login_rejects_noncanonical_2fa_assertion(
         Mock(return_value=(False, True, False)),
     )
     admin_api = Mock()
-    monkeypatch.setattr(views.requests, "get", admin_api)
+    monkeypatch.setattr(views.DiscourseApiClient, "get", admin_api)
 
     assert views.return_view(request) == ("redirect", "/login/")
     admin_api.assert_not_called()
@@ -522,7 +538,7 @@ def test_every_existing_privileged_user_requires_discord_2fa(
         Mock(return_value=privilege_flags),
     )
     admin_api = Mock()
-    monkeypatch.setattr(views.requests, "get", admin_api)
+    monkeypatch.setattr(views.DiscourseApiClient, "get", admin_api)
 
     assert views.return_view(request) == ("redirect", "/login/")
     admin_api.assert_not_called()

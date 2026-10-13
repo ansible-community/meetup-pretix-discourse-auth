@@ -44,6 +44,27 @@ _CALLBACK_RATE_LIMIT = 10
 _CALLBACK_RATE_WINDOW_SECONDS = 60
 
 
+class DiscourseApiClient:
+    """Per-request Requests session with shared Discourse API settings."""
+
+    def __init__(self) -> None:
+        self.base_url = f"{SETTINGS.discourse_url}/"
+        self.timeout = SETTINGS.api_timeout
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "Api-Key": SETTINGS.api_key,
+                "Api-Username": SETTINGS.api_username,
+                "Accept": "application/json",
+            }
+        )
+
+    def get(self, path: str, **kwargs):
+        kwargs.setdefault("timeout", self.timeout)
+        kwargs.setdefault("allow_redirects", False)
+        return self.session.get(f"{self.base_url}{path.lstrip('/')}", **kwargs)
+
+
 def _rate_limit_response(request, *, weight=1):
     """Count callback attempts by trusted client IP in the shared Django cache."""
     try:
@@ -327,17 +348,8 @@ def return_view(request):
             log_message="RTBF account attempted SSO",
         )
 
-    admin_url = f"{SETTINGS.discourse_url}/admin/users/{external_id}.json"
     try:
-        response = requests.get(
-            admin_url,
-            headers={
-                "Api-Key": SETTINGS.api_key,
-                "Api-Username": SETTINGS.api_username,
-            },
-            timeout=SETTINGS.api_timeout,
-            allow_redirects=False,
-        )
+        response = DiscourseApiClient().get(f"admin/users/{external_id}.json")
         if response.status_code != 200:
             raise requests.HTTPError(f"Unexpected HTTP status {response.status_code}")
         data = response.json()
