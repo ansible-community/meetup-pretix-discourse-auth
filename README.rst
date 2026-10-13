@@ -30,7 +30,8 @@ still apply.
 
 The moderation check uses a configured ``requests.Session`` client for the
 Discourse base URL, API headers, and timeout. Redirects are disabled so the API
-key is not forwarded to another URL.
+key is not forwarded to another URL. Outbound API calls use the User-Agent
+``Ansible-pretix-discourse-auth/0.1.0 (+https://github.com/ansible-community/meetup-pretix-discourse-auth)``.
 
 Development setup
 -----------------

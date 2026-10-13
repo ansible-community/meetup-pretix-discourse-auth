@@ -150,6 +150,7 @@ Username and display name heuristics are **not used** — they produce false pos
 - Call `GET {DISCOURSE_URL}/admin/users/{external_id}.json` with headers `Api-Key` and `Api-Username`.
 - Timeout: 10 seconds by default (`api_timeout`, valid range 1–60).
 - Use a configured `requests.Session` client that stores the Discourse base URL, API headers, and timeout together. Disable redirects so the API key cannot be forwarded to another URL.
+- Set the User-Agent to `Ansible-pretix-discourse-auth/0.1.0 (+https://github.com/ansible-community/meetup-pretix-discourse-auth)` on every outbound API request.
 - Parse response JSON once, store in a local variable. The Discourse Admin API returns the user object directly (`root: false`), so `api_data = raw_data` — no `raw_data.get('user', raw_data)` wrapper needed.
 
 **On HTTP 200, validate identity and extract moderation status:** The response must contain the requested `id` and a non-empty `username`. `silenced_till` and `suspended_till` are optional; each must be a string or `null` when present. Missing moderation fields mean the user is not in that state, as Discourse omits them for ordinary users. An empty object, mismatched identity, or invalid field type is an API response failure and blocks login.

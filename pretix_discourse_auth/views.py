@@ -42,6 +42,10 @@ _LOGIN_URL = "control:auth.login"
 _EXTERNAL_ID_RE = re.compile(r"^[0-9]{1,20}$")
 _CALLBACK_RATE_LIMIT = 10
 _CALLBACK_RATE_WINDOW_SECONDS = 60
+HTTP_USER_AGENT = (
+    "Ansible-pretix-discourse-auth/0.1.0 "
+    "(+https://github.com/ansible-community/meetup-pretix-discourse-auth)"
+)
 
 
 class DiscourseApiClient:
@@ -56,6 +60,7 @@ class DiscourseApiClient:
                 "Api-Key": SETTINGS.api_key,
                 "Api-Username": SETTINGS.api_username,
                 "Accept": "application/json",
+                "User-Agent": HTTP_USER_AGENT,
             }
         )
 

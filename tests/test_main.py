@@ -122,6 +122,12 @@ def test_discourse_api_client_uses_configured_session_defaults(monkeypatch):
     )
     assert client.session.headers["Api-Key"] == views.SETTINGS.api_key
     assert client.session.headers["Api-Username"] == views.SETTINGS.api_username
+    expected_user_agent = (
+        "Ansible-pretix-discourse-auth/0.1.0 "
+        "(+https://github.com/ansible-community/meetup-pretix-discourse-auth)"
+    )
+    assert views.HTTP_USER_AGENT == expected_user_agent
+    assert client.session.headers["User-Agent"] == expected_user_agent
 
 
 def make_user():
