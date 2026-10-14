@@ -1,0 +1,5 @@
+[plugin]
+package = "pretix-discourse-auth"
+modules = [ "pretix_discourse_auth" ]
+marketplace_name = "pretix-discourse-auth"
+
