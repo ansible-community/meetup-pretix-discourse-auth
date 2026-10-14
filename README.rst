@@ -1,5 +1,5 @@
 Discourse Auth for Pretix
-========================
+=========================
 
 This repository contains the ``pretix-discourse-auth`` Pretix plugin, a
 Discourse authentication backend for Pretix. The plugin is distributed as a
