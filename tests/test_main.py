@@ -484,8 +484,14 @@ def test_rate_limiter_cache_failure_fails_closed(callback_harness, monkeypatch):
 def test_stale_city_team_membership_is_removed(callback_harness, monkeypatch):
     request = make_callback(groups="meetup-organisers-london", confirmed_2fa=True)
     allow_moderation_check(monkeypatch)
-    stale_team = SimpleNamespace(members=SimpleNamespace(remove=Mock()))
-    city_team = SimpleNamespace(members=SimpleNamespace(add=Mock()))
+    stale_team = SimpleNamespace(
+        name=f"{views.TEAM_NAME_PREFIX}Paris",
+        members=SimpleNamespace(remove=Mock()),
+    )
+    city_team = SimpleNamespace(
+        name=f"{views.TEAM_NAME_PREFIX}London",
+        members=SimpleNamespace(add=Mock()),
+    )
     user_teams = Mock()
 
     def filter_user_teams(**kwargs):
